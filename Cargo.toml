@@ -8,3 +8,8 @@ resolver = "2"
 lto = "thin"
 codegen-units = 1
 overflow-checks = true
+
+[patch.crates-io]
+# Patch to use a version of solana_rbpf that's still available
+# The exact version 0.8.0 was yanked from crates.io
+solana_rbpf = { git = "https://github.com/solana-labs/rbpf", rev = "v0.8.0" }

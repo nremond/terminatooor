@@ -1,7 +1,8 @@
 use anchor_lang::prelude::Pubkey;
 use anyhow::Result;
 use colored::Colorize;
-use kamino_lending::{utils::Fraction, LiquidationParams, Obligation};
+pub use kamino_lending::utils::Fraction;
+use kamino_lending::{LiquidationParams, Obligation};
 use tracing::{debug, info};
 
 use crate::{liquidator::Holdings, model::StateWithKey};

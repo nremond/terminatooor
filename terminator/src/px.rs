@@ -2,8 +2,9 @@ use std::{collections::HashMap, str::FromStr};
 
 use anchor_lang::prelude::Pubkey;
 use anyhow::Result;
-use juno::SwapPrice;
 use tracing::info;
+
+use crate::titan::{self, SwapPrice};
 
 pub struct Prices {
     pub prices: HashMap<Pubkey, f64>,
@@ -24,7 +25,7 @@ pub async fn fetch_jup_prices(
     output_mint: &Pubkey,
     amount: f32,
 ) -> Result<Prices> {
-    let raw_prices = juno::get_prices(input_mints, output_mint, amount).await?;
+    let raw_prices = titan::get_prices(input_mints, output_mint, amount).await?;
     let mut prices: HashMap<Pubkey, f64> = HashMap::new();
     for (mint, SwapPrice { price, .. }) in raw_prices {
         prices.insert(Pubkey::from_str(&mint).unwrap(), price as f64);

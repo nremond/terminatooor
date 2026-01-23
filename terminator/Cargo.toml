@@ -50,9 +50,23 @@ thiserror = "1.0.0"
 farms = { git = "https://github.com/Kamino-Finance/kfarms", default-features = false, features = ["no-entrypoint"] }
 static-pubkey = "1.0.3"
 spl-token = "3.5.0"
-juno = { git = "https://github.com/Kamino-Finance/juno" }
+# Swap API utilities (Titan)
+base64 = "0.21"
+once_cell = "1.19"
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
+uuid = { version = "1.6", features = ["v4"] }
+url = "2.5"
+futures-util = "0.3"
+rmpv = "=1.0.1"
+rmp = "=0.8.12"
 dotenvy = "0.15.7"
 spl-token-client = "0.7.1"
 itertools = "0.12.0"
 lazy_static = "1.4.0"
-fixed = "1.27.0"
+fixed = "=1.27.0"
+
+# Geyser/LaserStream dependencies
+yellowstone-grpc-client = "1.13.0"
+yellowstone-grpc-proto = "1.12.0"
+tonic = "0.10"
+backoff = { version = "0.4", features = ["tokio"] }

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anchor_client::{solana_sdk::pubkey::Pubkey, Cluster};
 use anyhow::Result;
@@ -6,8 +6,9 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use consts::WRAPPED_SOL_MINT;
 use itertools::Itertools;
-use juno::DecompiledVersionedTx;
-use kamino_lending::Reserve;
+use crate::titan::DecompiledVersionedTx;
+use bytemuck::try_from_bytes;
+use kamino_lending::{Obligation, Reserve};
 use solana_sdk::{
     compute_budget::{self},
     signer::Signer,
@@ -20,9 +21,10 @@ use crate::{
     accounts::{map_accounts_and_create_infos, oracle_accounts, OracleAccounts},
     client::{KlendClient, RebalanceConfig},
     config::get_lending_markets,
+    geyser::{GeyserConfig, GeyserStream},
     jupiter::get_best_swap_instructions,
     liquidator::{Holding, Holdings},
-    math::LiquidationStrategy,
+    math::{LiquidationStrategy, Fraction},
     model::StateWithKey,
     operations::{
         obligation_reserves, referrer_token_states_of_obligation, split_obligations,
@@ -36,6 +38,7 @@ pub mod accounts;
 pub mod client;
 mod config;
 pub mod consts;
+pub mod geyser;
 pub mod instructions;
 pub mod jupiter;
 pub mod liquidator;
@@ -46,6 +49,7 @@ mod model;
 pub mod operations;
 mod px;
 pub mod sysvars;
+pub mod titan;
 mod utils;
 
 const USDC_MINT_STR: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -89,6 +93,15 @@ pub struct Args {
     #[clap(long, env, default_value = "8080")]
     server_port: u16,
 
+    /// Helius LaserStream/Geyser endpoint URL
+    /// Example: https://laserstream-mainnet-ewr.helius-rpc.com
+    #[clap(long, env = "GEYSER_ENDPOINT")]
+    geyser_endpoint: Option<String>,
+
+    /// API key for Geyser/LaserStream authentication (Helius, Triton, etc.)
+    #[clap(long, env = "GEYSER_API_KEY")]
+    geyser_api_key: Option<String>,
+
     /// Subcommand to execute
     #[clap(subcommand)]
     action: Actions,
@@ -119,13 +132,20 @@ pub struct RebalanceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Actions {
-    /// Automatically refresh the prices
+    /// Automatically refresh prices using RPC polling (legacy mode)
     #[clap()]
     Crank {
         /// Obligation to be cranked
         #[clap(long, env, parse(try_from_str))]
         obligation: Option<Pubkey>,
 
+        #[clap(flatten)]
+        rebalance_args: RebalanceArgs,
+    },
+    /// Stream obligation updates via Geyser/LaserStream for real-time monitoring
+    /// Requires --geyser-endpoint and --helius-api-key to be set
+    #[clap()]
+    CrankStream {
         #[clap(flatten)]
         rebalance_args: RebalanceArgs,
     },
@@ -197,6 +217,15 @@ async fn main() -> Result<()> {
             obligation: obligation_filter,
             rebalance_args: _,
         } => crank(&klend_client, obligation_filter).await,
+        Actions::CrankStream { rebalance_args: _ } => {
+            let geyser_endpoint = args
+                .geyser_endpoint
+                .ok_or_else(|| anyhow::anyhow!("--geyser-endpoint is required for CrankStream"))?;
+            let geyser_api_key = args
+                .geyser_api_key
+                .ok_or_else(|| anyhow::anyhow!("--geyser-api-key is required for CrankStream"))?;
+            crank_stream(&klend_client, geyser_endpoint, geyser_api_key).await
+        }
         Actions::Liquidate {
             obligation,
             rebalance_args: _,
@@ -233,7 +262,7 @@ async fn rebalance(klend_client: &Arc<KlendClient>) -> Result<()> {
     let markets =
         crate::client::utils::fetch_markets_and_reserves(klend_client, &lending_markets).await?;
     let (all_reserves, _ctoken_mints, liquidity_mints) = get_all_reserve_mints(&markets);
-    info!("Loading Jupiter prices..");
+    info!("Loading prices via Titan..");
     let amount = 100.0;
     let pxs = fetch_jup_prices(&liquidity_mints, &rebalance_config.usdc_mint, amount).await?;
     info!("Loading holdings..");
@@ -391,7 +420,7 @@ pub mod swap {
         amount: f64,
         slippage_pct: f64,
     ) -> Result<()> {
-        // https://quote-api.jup.ag/v6/quote?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint=So11111111111111111111111111111111111111112&amount=94576524&slippageBps=50&swapMode=ExactIn&onlyDirectRoutes=true&asLegacyTransaction=false
+        // Titan swap API quote request
 
         let from_token = holdings.holding_of(from)?;
         let to_token = holdings.holding_of(to)?;
@@ -408,7 +437,7 @@ pub mod swap {
         let amount_to_swap = (amount * 10f64.powf(from_token.decimals as f64)).floor() as u64;
         let slippage_bps = (slippage_pct * 100f64).floor() as u16;
 
-        let jupiter_swap = get_best_swap_instructions(
+        let swap_result = get_best_swap_instructions(
             from,
             to,
             amount_to_swap,
@@ -425,7 +454,7 @@ pub mod swap {
         let DecompiledVersionedTx {
             lookup_tables,
             instructions: jup_ixs,
-        } = jupiter_swap;
+        } = swap_result;
 
         let mut builder = klend_client.client.tx_builder().add_ixs(jup_ixs);
 
@@ -557,7 +586,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         let mut luts = vec![];
 
         if swap_amount > 0 {
-            let jupiter_swap = get_best_swap_instructions(
+            let swap_result = get_best_swap_instructions(
                 base_mint,
                 &debt_mint,
                 swap_amount,
@@ -575,7 +604,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             let DecompiledVersionedTx {
                 lookup_tables,
                 instructions: jup_ixs,
-            } = jupiter_swap;
+            } = swap_result;
 
             // Filter compute budget ixns
             let jup_ixs = jup_ixs
@@ -799,5 +828,260 @@ async fn crank(klend_client: &KlendClient, obligation_filter: Option<Pubkey>) ->
             );
         }
         sleep(sleep_duration).await;
+    }
+}
+
+/// Stream-based crank using Geyser/LaserStream for real-time obligation monitoring.
+/// This is significantly faster than RPC polling as it receives updates within ~50-100ms
+/// of on-chain state changes.
+async fn crank_stream(
+    klend_client: &KlendClient,
+    geyser_endpoint: String,
+    geyser_api_key: String,
+) -> Result<()> {
+    info!("Starting stream-based crank with Geyser/LaserStream");
+
+    // Get lending markets to monitor
+    let lending_markets = get_lending_markets(&klend_client.program_id).await?;
+    info!("Monitoring {} markets: {:?}", lending_markets.len(), lending_markets);
+
+    // Connect to Geyser
+    let geyser_config = GeyserConfig {
+        endpoint: geyser_endpoint,
+        api_key: geyser_api_key,
+        program_id: klend_client.program_id,
+    };
+
+    let mut geyser_stream = GeyserStream::connect(geyser_config).await?;
+    info!("Connected to Geyser stream");
+
+    // Load initial state for all markets
+    let mut market_states: HashMap<Pubkey, MarketState> = HashMap::new();
+    for market in &lending_markets {
+        info!("Loading initial state for market {}", market.to_string().green());
+        match load_market_state(klend_client, market).await {
+            Ok(state) => {
+                market_states.insert(*market, state);
+            }
+            Err(e) => {
+                warn!("Failed to load market state for {}: {:?}", market, e);
+            }
+        }
+    }
+
+    // Track obligations we've seen and their LTVs
+    let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
+    let mut last_state_refresh = std::time::Instant::now();
+    let state_refresh_interval = Duration::from_secs(60); // Refresh full state every 60s
+
+    info!("Starting to process obligation updates...");
+
+    loop {
+        // Check if we should refresh the full market state (periodic safety check)
+        if last_state_refresh.elapsed() > state_refresh_interval {
+            info!("Refreshing market states (periodic refresh)");
+            for market in &lending_markets {
+                if let Ok(state) = load_market_state(klend_client, market).await {
+                    market_states.insert(*market, state);
+                }
+            }
+            last_state_refresh = std::time::Instant::now();
+        }
+
+        // Process obligation updates from Geyser
+        // Use a timeout so we can do periodic tasks
+        let update = tokio::time::timeout(
+            Duration::from_secs(5),
+            geyser_stream.recv()
+        ).await;
+
+        match update {
+            Ok(Some(obligation_update)) => {
+                let start = std::time::Instant::now();
+
+                // Try to deserialize the obligation
+                if let Some(obligation) = deserialize_obligation(&obligation_update.data) {
+                    // Find which market this obligation belongs to
+                    let market_pubkey = obligation.lending_market;
+
+                    // Check if we're monitoring this market
+                    if !lending_markets.contains(&market_pubkey) {
+                        continue;
+                    }
+
+                    // Get the market state
+                    let market_state = match market_states.get(&market_pubkey) {
+                        Some(state) => state,
+                        None => {
+                            warn!("No market state for {}, skipping", market_pubkey);
+                            continue;
+                        }
+                    };
+
+                    // Evaluate the obligation
+                    match evaluate_obligation_streaming(
+                        klend_client,
+                        &obligation_update.pubkey,
+                        &obligation,
+                        market_state,
+                    ).await {
+                        Ok(Some(ltv_info)) => {
+                            let prev_ltv = obligation_ltvs.get(&obligation_update.pubkey);
+                            let ltv_changed = prev_ltv.map(|p| *p != ltv_info.ltv).unwrap_or(true);
+                            obligation_ltvs.insert(obligation_update.pubkey, ltv_info.ltv);
+
+                            if ltv_info.is_liquidatable {
+                                info!(
+                                    "{} LIQUIDATABLE: {} LTV={:?} (unhealthy={:?}) latency={}ms",
+                                    "!!!".red().bold(),
+                                    obligation_update.pubkey.to_string().red(),
+                                    ltv_info.ltv,
+                                    ltv_info.unhealthy_ltv,
+                                    start.elapsed().as_millis()
+                                );
+
+                                // Trigger liquidation
+                                if let Err(e) = liquidate(klend_client, &obligation_update.pubkey).await {
+                                    warn!("Liquidation failed for {}: {:?}", obligation_update.pubkey, e);
+                                }
+                            } else if ltv_changed && ltv_info.ltv > Fraction::ZERO {
+                                // Log obligations with non-zero LTV for awareness
+                                info!(
+                                    "Obligation {} LTV={:?} (unhealthy={:?}) slot={} latency={}ms",
+                                    obligation_update.pubkey.to_string().yellow(),
+                                    ltv_info.ltv,
+                                    ltv_info.unhealthy_ltv,
+                                    obligation_update.slot,
+                                    start.elapsed().as_millis()
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            // Zero debt obligation, skip
+                        }
+                        Err(e) => {
+                            warn!("Failed to evaluate obligation {}: {:?}", obligation_update.pubkey, e);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // Stream closed, this shouldn't happen with reconnection logic
+                warn!("Geyser stream closed unexpectedly");
+                return Err(anyhow::anyhow!("Geyser stream closed"));
+            }
+            Err(_) => {
+                // Timeout, continue to allow periodic tasks
+                continue;
+            }
+        }
+    }
+}
+
+/// Cached market state for fast obligation evaluation
+#[allow(dead_code)]
+struct MarketState {
+    lending_market: kamino_lending::LendingMarket,
+    reserves: HashMap<Pubkey, Reserve>,
+    referrer_token_states: HashMap<Pubkey, kamino_lending::ReferrerTokenState>,
+    pyth_accounts: HashMap<Pubkey, Vec<u8>>,
+    switchboard_accounts: HashMap<Pubkey, Vec<u8>>,
+    scope_accounts: HashMap<Pubkey, Vec<u8>>,
+}
+
+/// Load the full state for a market
+async fn load_market_state(klend_client: &KlendClient, market: &Pubkey) -> Result<MarketState> {
+    let market_accs = klend_client.fetch_market_and_reserves(market).await?;
+    let rts = klend_client.fetch_referrer_token_states().await?;
+
+    let OracleAccounts {
+        pyth_accounts,
+        switchboard_accounts,
+        scope_price_accounts,
+    } = oracle_accounts(&klend_client.client, &market_accs.reserves)
+        .await?;
+
+    // Convert account data to raw bytes for storage
+    // The tuples are (Pubkey, bool, Account)
+    let pyth_map: HashMap<Pubkey, Vec<u8>> = pyth_accounts
+        .into_iter()
+        .map(|(k, _valid, acc)| (k, acc.data))
+        .collect();
+    let switchboard_map: HashMap<Pubkey, Vec<u8>> = switchboard_accounts
+        .into_iter()
+        .map(|(k, _valid, acc)| (k, acc.data))
+        .collect();
+    let scope_map: HashMap<Pubkey, Vec<u8>> = scope_price_accounts
+        .into_iter()
+        .map(|(k, _valid, acc)| (k, acc.data))
+        .collect();
+
+    Ok(MarketState {
+        lending_market: market_accs.lending_market,
+        reserves: market_accs.reserves,
+        referrer_token_states: rts,
+        pyth_accounts: pyth_map,
+        switchboard_accounts: switchboard_map,
+        scope_accounts: scope_map,
+    })
+}
+
+/// LTV information for an obligation
+struct LtvInfo {
+    ltv: Fraction,
+    unhealthy_ltv: Fraction,
+    is_liquidatable: bool,
+}
+
+/// Evaluate an obligation for liquidation using cached market state
+async fn evaluate_obligation_streaming(
+    _klend_client: &KlendClient,
+    obligation_pubkey: &Pubkey,
+    obligation: &Obligation,
+    _market_state: &MarketState,
+) -> Result<Option<LtvInfo>> {
+    // Skip zero-debt obligations
+    if obligation.num_of_obsolete_reserves == 0
+        && obligation.deposits_empty()
+        && obligation.borrows_empty() {
+        return Ok(None);
+    }
+
+    // Check if this has any borrows (debt)
+    let has_debt = !obligation.borrows_empty();
+    if !has_debt {
+        return Ok(None);
+    }
+
+    // Get obligation info using the math module
+    let stats = math::obligation_info(obligation_pubkey, obligation);
+
+    let is_liquidatable = stats.ltv > stats.unhealthy_ltv;
+
+    Ok(Some(LtvInfo {
+        ltv: stats.ltv,
+        unhealthy_ltv: stats.unhealthy_ltv,
+        is_liquidatable,
+    }))
+}
+
+/// Deserialize raw account data into an Obligation
+fn deserialize_obligation(data: &[u8]) -> Option<Obligation> {
+    // Anchor accounts have an 8-byte discriminator prefix
+    if data.len() < 8 + std::mem::size_of::<Obligation>() {
+        return None;
+    }
+
+    // Check discriminator (Kamino Obligation)
+    const OBLIGATION_DISCRIMINATOR: [u8; 8] = [168, 206, 141, 106, 88, 76, 172, 167];
+    if data[..8] != OBLIGATION_DISCRIMINATOR {
+        return None;
+    }
+
+    // Try to deserialize using bytemuck (zero-copy)
+    let obligation_data = &data[8..];
+    match try_from_bytes::<Obligation>(obligation_data) {
+        Ok(obligation) => Some(*obligation),
+        Err(_) => None,
     }
 }

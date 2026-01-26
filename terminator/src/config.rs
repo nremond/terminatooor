@@ -1,45 +1,20 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
+use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anchor_lang::{prelude::Pubkey, solana_program};
 use anyhow::{anyhow, Result};
-use lazy_static::lazy_static;
 use orbit_link::OrbitLink;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     signature::{read_keypair_file, Keypair},
 };
-use static_pubkey::static_pubkey;
 
 use crate::{
     client::{KlendClient, RebalanceConfig},
     Actions, Args, RebalanceArgs,
 };
 
-lazy_static! {
-    pub static ref LENDING_MARKETS: HashMap<Pubkey, Vec<Pubkey>> = {
-        let mut m = HashMap::new();
-        let mainnet_markets = vec![
-            static_pubkey!("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF"),
-            static_pubkey!("ByYiZxp8QrdN9qbdtaAiePN8AAr3qvTPppNJDpf5DVJ5"),
-            static_pubkey!("DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek"),
-        ];
-        m.insert(
-            static_pubkey!("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"),
-            mainnet_markets,
-        );
-        let staging_markets = vec![static_pubkey!(
-            "6WVSwDQXrBZeQVnu6hpnsRZhodaJTZBUaC334SiiBKdb"
-        )];
-        m.insert(
-            static_pubkey!("SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh"),
-            staging_markets,
-        );
-        m
-    };
-}
-
-pub async fn get_lending_markets(program_id: &Pubkey) -> Result<Vec<Pubkey>> {
+pub async fn get_lending_markets(client: &crate::client::KlendClient) -> Result<Vec<Pubkey>> {
     let env = std::env::var("MARKETS").ok();
     let markets = if let Some(markets) = env {
         let markets: Vec<Pubkey> = markets
@@ -48,11 +23,8 @@ pub async fn get_lending_markets(program_id: &Pubkey) -> Result<Vec<Pubkey>> {
             .collect();
         markets
     } else {
-        // todo use API
-        let markets = LENDING_MARKETS
-            .get(program_id)
-            .ok_or(anyhow!("No markets found for program {:?}", program_id))?;
-        markets.clone()
+        // Fetch all markets dynamically from the program
+        client.fetch_all_markets().await?
     };
     Ok(markets)
 }

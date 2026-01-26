@@ -136,8 +136,20 @@ pub fn decide_liquidation_strategy(
     // Compare to what we have already
     let debt_mint = &debt_reserve.state.borrow().liquidity.mint_pubkey;
 
-    let debt_holding = holdings.holding_of(debt_mint).unwrap();
-    let base_holding = holdings.holding_of(base_mint).unwrap();
+    let debt_holding = match holdings.holding_of(debt_mint) {
+        Ok(h) => h,
+        Err(_) => {
+            info!("No holding for debt mint {}, skipping liquidation", debt_mint);
+            return Ok(None);
+        }
+    };
+    let base_holding = match holdings.holding_of(base_mint) {
+        Ok(h) => h,
+        Err(_) => {
+            info!("No holding for base mint {}, skipping liquidation", base_mint);
+            return Ok(None);
+        }
+    };
 
     // Always assume we are fully rebalanced otherwise it's very hard to decide
     let decision = if debt_mint == base_mint {

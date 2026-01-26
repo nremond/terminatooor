@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
 }
 
 async fn rebalance(klend_client: &Arc<KlendClient>) -> Result<()> {
-    let lending_markets = get_lending_markets(&klend_client.program_id).await?;
+    let lending_markets = get_lending_markets(klend_client).await?;
 
     info!("Rebalancing...");
     let rebalance_config = match &klend_client.rebalance_config {
@@ -400,7 +400,7 @@ pub mod swap {
             Some(c) => Ok(c),
         }?;
 
-        let lending_markets = get_lending_markets(&klend_client.program_id).await?;
+        let lending_markets = get_lending_markets(klend_client).await?;
         let markets =
             client::utils::fetch_markets_and_reserves(klend_client, &lending_markets).await?;
         let (reserves, _, l_mints) = get_all_reserve_mints(&markets);
@@ -681,7 +681,7 @@ async fn crank(klend_client: &KlendClient, obligation_filter: Option<Pubkey>) ->
     let sleep_duration = Duration::from_secs(10);
     let (markets, ob) = match obligation_filter {
         None => {
-            let lending_markets = get_lending_markets(&klend_client.program_id).await?;
+            let lending_markets = get_lending_markets(klend_client).await?;
             info!("Cranking all markets {lending_markets:?}..");
             (lending_markets, None)
         }
@@ -842,7 +842,7 @@ async fn crank_stream(
     info!("Starting stream-based crank with Geyser/LaserStream");
 
     // Get lending markets to monitor
-    let lending_markets = get_lending_markets(&klend_client.program_id).await?;
+    let lending_markets = get_lending_markets(klend_client).await?;
     info!("Monitoring {} markets: {:?}", lending_markets.len(), lending_markets);
 
     // Connect to Geyser

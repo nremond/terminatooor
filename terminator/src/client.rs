@@ -94,6 +94,51 @@ impl KlendClient {
         market_and_reserve_accounts(self, market).await
     }
 
+    /// Fetch top lending markets by borrow volume
+    pub async fn fetch_all_markets(&self) -> Result<Vec<Pubkey>> {
+        info!("Fetching active lending markets for program: {}", self.program_id);
+
+        // Max number of markets to monitor (default: 30)
+        let max_markets: usize = std::env::var("MAX_MARKETS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+
+        // Fetch all reserves
+        let reserves: Vec<(Pubkey, Reserve)> =
+            rpc::get_zero_copy_pa(&self.client, &self.program_id, &[]).await?;
+
+        // Sum borrowed amounts per market
+        let mut market_borrows: std::collections::HashMap<Pubkey, u128> =
+            std::collections::HashMap::new();
+        for (_, reserve) in &reserves {
+            *market_borrows.entry(reserve.lending_market).or_insert(0) +=
+                reserve.liquidity.borrowed_amount_sf;
+        }
+
+        let total_markets = market_borrows.len();
+
+        // Sort by borrow volume (descending) and take top N
+        let mut markets_sorted: Vec<(Pubkey, u128)> = market_borrows
+            .into_iter()
+            .filter(|(_, borrows)| *borrows > 0) // Must have some borrows
+            .collect();
+        markets_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let pubkeys: Vec<Pubkey> = markets_sorted
+            .iter()
+            .take(max_markets)
+            .map(|(pk, _)| *pk)
+            .collect();
+
+        info!(
+            "Selected top {} markets by borrow volume (from {} total with reserves)",
+            pubkeys.len(),
+            total_markets
+        );
+        Ok(pubkeys)
+    }
+
     pub async fn fetch_obligations(&self, market: &Pubkey) -> Result<Vec<(Pubkey, Obligation)>> {
         info!("Fetching obligations for market: {}", market);
         let filter = RpcFilterType::Memcmp(Memcmp::new(

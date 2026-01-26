@@ -30,7 +30,7 @@ use crate::{
         obligation_reserves, referrer_token_states_of_obligation, split_obligations,
         ObligationReserves, SplitObligations,
     },
-    px::fetch_jup_prices,
+    px::fetch_prices,
     utils::get_all_reserve_mints,
 };
 
@@ -264,7 +264,7 @@ async fn rebalance(klend_client: &Arc<KlendClient>) -> Result<()> {
     let (all_reserves, _ctoken_mints, liquidity_mints) = get_all_reserve_mints(&markets);
     info!("Loading prices via Titan..");
     let amount = 100.0;
-    let pxs = fetch_jup_prices(&liquidity_mints, &rebalance_config.usdc_mint, amount).await?;
+    let pxs = fetch_prices(&liquidity_mints, &rebalance_config.usdc_mint, amount).await?;
     info!("Loading holdings..");
     let mut holdings = klend_client
         .liquidator
@@ -404,7 +404,7 @@ pub mod swap {
         let markets =
             client::utils::fetch_markets_and_reserves(klend_client, &lending_markets).await?;
         let (reserves, _, l_mints) = get_all_reserve_mints(&markets);
-        let pxs = fetch_jup_prices(&l_mints, &rebalance_config.usdc_mint, amount as f32).await?;
+        let pxs = fetch_prices(&l_mints, &rebalance_config.usdc_mint, amount as f32).await?;
         let holdings = klend_client
             .liquidator
             .fetch_holdings(&klend_client.client.client, &reserves, &pxs)
@@ -522,7 +522,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     let coll_reserve = StateWithKey::new(coll_reserve_state, coll_res_key);
     let lending_market = StateWithKey::new(*market, ob.lending_market);
     let obligation = StateWithKey::new(ob, *obligation);
-    let pxs = fetch_jup_prices(&[debt_mint], &rebalance_config.usdc_mint, 100.0).await?;
+    let pxs = fetch_prices(&[debt_mint, WRAPPED_SOL_MINT], &rebalance_config.usdc_mint, 100.0).await?;
     let holdings = klend_client
         .liquidator
         .fetch_holdings(&klend_client.client.client, &reserves, &pxs)
@@ -872,7 +872,7 @@ async fn crank_stream(
     // Track obligations we've seen and their LTVs
     let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
     let mut last_state_refresh = std::time::Instant::now();
-    let state_refresh_interval = Duration::from_secs(60); // Refresh full state every 60s
+    let state_refresh_interval = Duration::from_secs(3600); // Refresh full state every 60 min (fallback only)
 
     info!("Starting to process obligation updates...");
 

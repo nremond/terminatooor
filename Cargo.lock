@@ -1140,7 +1140,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4114279215a005bc675e386011e594e1d9b800918cea18fcadadcce864a2046b"
 dependencies = [
  "borsh-derive 0.10.3",
- "hashbrown 0.13.2",
+ "hashbrown 0.12.3",
 ]
 
 [[package]]
@@ -2168,8 +2168,8 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 
 [[package]]
 name = "farms"
-version = "0.1.0"
-source = "git+https://github.com/Kamino-Finance/kfarms#23da54c9f1433257351242c964f9806cb16fa205"
+version = "1.6.5"
+source = "git+https://github.com/Kamino-Finance/kfarms#2a63e5ab59629c77f8b4043781c1e4b4572c7b60"
 dependencies = [
  "anchor-lang",
  "anchor-spl",

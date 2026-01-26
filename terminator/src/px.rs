@@ -20,7 +20,7 @@ impl Prices {
     }
 }
 
-pub async fn fetch_jup_prices(
+pub async fn fetch_prices(
     input_mints: &[Pubkey],
     output_mint: &Pubkey,
     amount: f32,

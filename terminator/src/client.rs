@@ -339,7 +339,7 @@ impl KlendClient {
 
         // TOOD: fix amount to be per token
         let amount = 100.0;
-        px::fetch_jup_prices(&mints, usd_mint, amount).await
+        px::fetch_prices(&mints, usd_mint, amount).await
     }
 
     #[allow(clippy::too_many_arguments)]

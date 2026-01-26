@@ -490,6 +490,12 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         .fetch_market_and_reserves(&ob.lending_market)
         .await?;
     let mut reserves = market_accs.reserves;
+
+    // Ensure ATAs exist for all reserve mints before liquidation
+    klend_client
+        .liquidator
+        .ensure_atas_for_reserves(klend_client, &reserves)
+        .await?;
     let market = &market_accs.lending_market;
     // todo - don't load all
     let rts = klend_client.fetch_referrer_token_states().await?;
@@ -861,6 +867,14 @@ async fn crank_stream(
         info!("Loading initial state for market {}", market.to_string().green());
         match load_market_state(klend_client, market).await {
             Ok(state) => {
+                // Ensure ATAs exist for all reserve mints
+                if let Err(e) = klend_client
+                    .liquidator
+                    .ensure_atas_for_reserves(klend_client, &state.reserves)
+                    .await
+                {
+                    warn!("Failed to ensure ATAs for market {}: {:?}", market, e);
+                }
                 market_states.insert(*market, state);
             }
             Err(e) => {
@@ -882,6 +896,14 @@ async fn crank_stream(
             info!("Refreshing market states (periodic refresh)");
             for market in &lending_markets {
                 if let Ok(state) = load_market_state(klend_client, market).await {
+                    // Ensure ATAs exist for any new reserve mints
+                    if let Err(e) = klend_client
+                        .liquidator
+                        .ensure_atas_for_reserves(klend_client, &state.reserves)
+                        .await
+                    {
+                        warn!("Failed to ensure ATAs for market {}: {:?}", market, e);
+                    }
                     market_states.insert(*market, state);
                 }
             }

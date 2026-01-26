@@ -22,9 +22,12 @@ pub fn collect_keys(
         lending_markets.insert(reserve.lending_market);
     }
 
-    for (mint, ata) in liquidator.atas.iter() {
-        keys.insert(*mint);
-        keys.insert(*ata);
+    {
+        let atas = liquidator.atas.read().unwrap();
+        for (mint, ata) in atas.iter() {
+            keys.insert(*mint);
+            keys.insert(*ata);
+        }
     }
 
     keys.insert(lending_market.lending_market_owner);

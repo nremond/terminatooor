@@ -3,7 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, RwLock},
     thread,
     time::Duration,
 };
@@ -78,7 +78,7 @@ impl KlendClient {
         // Create a dumb one first
         let liquidator = Liquidator {
             wallet: Arc::new(Keypair::new()),
-            atas: HashMap::new(),
+            atas: RwLock::new(HashMap::new()),
         };
 
         Ok(Self {

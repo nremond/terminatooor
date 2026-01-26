@@ -46,6 +46,15 @@ pub fn liquidate_obligation_and_redeem_reserve_collateral_ix(
     let collateral_token = coll_reserve_state.liquidity.mint_pubkey;
     let debt_token = debt_reserve_state.liquidity.mint_pubkey;
 
+    let (user_destination_collateral, user_destination_liquidity, user_source_liquidity) = {
+        let atas = liquidator.atas.read().unwrap();
+        (
+            *atas.get(&collateral_ctoken).unwrap(),
+            *atas.get(&collateral_token).unwrap(),
+            *atas.get(&debt_token).unwrap(),
+        )
+    };
+
     let instruction = Instruction {
         program_id: *program_id,
         accounts: kamino_lending::accounts::LiquidateObligationAndRedeemReserveCollateral {
@@ -60,9 +69,9 @@ pub fn liquidate_obligation_and_redeem_reserve_collateral_ix(
             withdraw_reserve_liquidity_fee_receiver: coll_reserve_state.liquidity.fee_vault,
             lending_market_authority,
             obligation,
-            user_destination_collateral: *liquidator.atas.get(&collateral_ctoken).unwrap(),
-            user_destination_liquidity: *liquidator.atas.get(&collateral_token).unwrap(),
-            user_source_liquidity: *liquidator.atas.get(&debt_token).unwrap(),
+            user_destination_collateral,
+            user_destination_liquidity,
+            user_source_liquidity,
             instruction_sysvar_account: sysvar::instructions::ID,
             repay_liquidity_token_program: Token::id(),
             repay_reserve_liquidity_mint: debt_reserve_state.liquidity.mint_pubkey,

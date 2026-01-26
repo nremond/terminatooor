@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc, RwLock}};
 
 use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
 use anchor_lang::{prelude::Pubkey, solana_program::program_pack::Pack, AccountDeserialize, Id};
@@ -42,10 +42,10 @@ impl Holdings {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Liquidator {
     pub wallet: Arc<Keypair>,
-    pub atas: HashMap<Pubkey, Pubkey>,
+    pub atas: RwLock<HashMap<Pubkey, Pubkey>>,
 }
 
 fn label_of(mint: &Pubkey, reserves: &HashMap<Pubkey, Reserve>) -> String {
@@ -97,9 +97,54 @@ impl Liquidator {
             None => Arc::new(Keypair::new()),
         };
 
-        let liquidator = Liquidator { wallet, atas };
+        let liquidator = Liquidator {
+            wallet,
+            atas: RwLock::new(atas),
+        };
 
         Ok(liquidator)
+    }
+
+    /// Ensure ATAs exist for all mints in the given reserves
+    pub async fn ensure_atas_for_reserves(
+        &self,
+        client: &KlendClient,
+        reserves: &HashMap<Pubkey, Reserve>,
+    ) -> Result<()> {
+        let mints: Vec<Pubkey> = {
+            let existing_atas = self.atas.read().unwrap();
+            reserves
+                .iter()
+                .flat_map(|(_, r)| [r.liquidity.mint_pubkey, r.collateral.mint_pubkey])
+                .filter(|mint| !existing_atas.contains_key(mint))
+                .collect()
+        };
+
+        if mints.is_empty() {
+            return Ok(());
+        }
+
+        info!("Creating ATAs for {} new mints...", mints.len());
+        let futures = mints
+            .iter()
+            .map(|mint| get_or_create_ata(client, &self.wallet, mint));
+        let results = futures::future::join_all(futures).await;
+
+        let mut atas = self.atas.write().unwrap();
+        for (i, result) in results.into_iter().enumerate() {
+            let mint = mints[i];
+            match result {
+                Ok(ata) => {
+                    atas.insert(mint, ata);
+                }
+                Err(e) => {
+                    warn!("Failed to create ATA for mint {}: {:?}", mint, e);
+                }
+            }
+        }
+
+        info!("Liquidator now has {} token ATAs", atas.len());
+        Ok(())
     }
 
     pub async fn fetch_holdings(
@@ -109,13 +154,20 @@ impl Liquidator {
         prices: &Prices,
     ) -> Result<Holdings> {
         let mut holdings = Vec::new();
+
+        // Get a snapshot of atas
+        let atas_snapshot: Vec<(Pubkey, Pubkey)> = {
+            let atas = self.atas.read().unwrap();
+            atas.iter().map(|(m, a)| (*m, *a)).collect()
+        };
+
         // TODO: optimize this, get all accounts in batch to have 1 single rpc call
-        let get_token_balance_futures = self
-            .atas
+        let get_token_balance_futures = atas_snapshot
             .iter()
             .map(|(mint, ata)| get_token_balance(client, mint, ata));
         let get_token_balance = futures::future::join_all(get_token_balance_futures).await;
-        for (i, (mint, ata)) in self.atas.iter().enumerate() {
+
+        for (i, (mint, ata)) in atas_snapshot.iter().enumerate() {
             match get_token_balance.get(i) {
                 Some(Ok((balance, decimals))) => {
                     let ui_balance = *balance as f64 / 10u64.pow(*decimals as u32) as f64;

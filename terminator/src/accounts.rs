@@ -191,9 +191,13 @@ pub async fn unwrap_wsol_ata(klend_client: &KlendClient) -> Result<String> {
     let user = klend_client.liquidator.wallet.pubkey();
 
     // Close the account
+    let wsol_ata = {
+        let atas = klend_client.liquidator.atas.read().unwrap();
+        *atas.get(&WRAPPED_SOL_MINT).unwrap()
+    };
     let instructions = vec![spl_token::instruction::close_account(
         &Token::id(),
-        klend_client.liquidator.atas.get(&WRAPPED_SOL_MINT).unwrap(),
+        &wsol_ata,
         &user,
         &user,
         &[],

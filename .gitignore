@@ -26,3 +26,7 @@ target/
 
 /config/routing_config.json
 rust_liquidator.json
+
+.DS_store
+.claude
+

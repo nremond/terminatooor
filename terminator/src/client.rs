@@ -717,28 +717,36 @@ pub async fn obligation_farms(
 
     let obligation_farm_debt_account = if farm_debt == Pubkey::default() {
         None
-    } else if let Ok(None) = find_account(&client.client, obligation_farm_debt).await {
-        None
     } else {
-        let acc = client
-            .get_anchor_account::<farms::state::UserState>(&obligation_farm_debt)
-            .await
-            .unwrap();
-
-        Some(StateWithKey::new(acc, obligation_farm_debt))
+        match find_account(&client.client, obligation_farm_debt).await {
+            Ok(Some(_)) => {
+                match client
+                    .get_anchor_account::<farms::state::UserState>(&obligation_farm_debt)
+                    .await
+                {
+                    Ok(acc) => Some(StateWithKey::new(acc, obligation_farm_debt)),
+                    Err(_) => None,
+                }
+            }
+            _ => None, // Ok(None) or Err(_) - account doesn't exist or error
+        }
     };
 
     let obligation_farm_coll_account = if farm_collateral == Pubkey::default() {
         None
-    } else if let Ok(None) = find_account(&client.client, obligation_farm_coll).await {
-        None
     } else {
-        let acc = client
-            .get_anchor_account::<farms::state::UserState>(&obligation_farm_coll)
-            .await
-            .unwrap();
-
-        Some(StateWithKey::new(acc, obligation_farm_coll))
+        match find_account(&client.client, obligation_farm_coll).await {
+            Ok(Some(_)) => {
+                match client
+                    .get_anchor_account::<farms::state::UserState>(&obligation_farm_coll)
+                    .await
+                {
+                    Ok(acc) => Some(StateWithKey::new(acc, obligation_farm_coll)),
+                    Err(_) => None,
+                }
+            }
+            _ => None, // Ok(None) or Err(_) - account doesn't exist or error
+        }
     };
 
     (obligation_farm_debt_account, obligation_farm_coll_account)

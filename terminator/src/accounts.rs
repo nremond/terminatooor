@@ -2,8 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use anchor_client::{
     solana_client::{
+        client_error::{ClientError, ClientErrorKind},
         nonblocking::rpc_client::RpcClient,
         rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
+        rpc_request::RpcError,
     },
     solana_sdk::{account::Account, account_info::AccountInfo, pubkey::Pubkey, signer::Signer},
 };
@@ -233,11 +235,13 @@ pub async fn find_account(
     client: &RpcClient,
     address: Pubkey,
 ) -> Result<Option<(Pubkey, Account)>> {
-    let res = client.get_account(&address).await;
-    if let Ok(account) = res {
-        Ok(Some((address, account)))
-    } else {
-        println!("Ata not found: {}", address);
-        Ok(None)
+    match client.get_account(&address).await {
+        Ok(account) => Ok(Some((address, account))),
+        Err(ClientError { kind: ClientErrorKind::RpcError(RpcError::ForUser(msg)), .. })
+            if msg.contains("could not find account") =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
     }
 }

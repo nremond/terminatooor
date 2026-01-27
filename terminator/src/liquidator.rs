@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, RwLock}};
+use std::{collections::HashMap, sync::{Arc, RwLock}, time::Duration};
 
 use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
 use anchor_lang::{prelude::Pubkey, solana_program::program_pack::Pack, AccountDeserialize, Id};
@@ -125,13 +125,26 @@ impl Liquidator {
         }
 
         info!("Creating ATAs for {} new mints...", mints.len());
-        let futures = mints
-            .iter()
-            .map(|mint| get_or_create_ata(client, &self.wallet, mint));
-        let results = futures::future::join_all(futures).await;
+
+        // Process in batches to avoid rate limiting
+        const BATCH_SIZE: usize = 10;
+        let mut all_results = Vec::with_capacity(mints.len());
+
+        for (batch_idx, chunk) in mints.chunks(BATCH_SIZE).enumerate() {
+            if batch_idx > 0 {
+                // Add delay between batches to avoid rate limiting
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            let futures = chunk
+                .iter()
+                .map(|mint| get_or_create_ata(client, &self.wallet, mint));
+            let batch_results = futures::future::join_all(futures).await;
+            all_results.extend(batch_results);
+        }
 
         let mut atas = self.atas.write().unwrap();
-        for (i, result) in results.into_iter().enumerate() {
+        for (i, result) in all_results.into_iter().enumerate() {
             let mint = mints[i];
             match result {
                 Ok(ata) => {
@@ -161,24 +174,44 @@ impl Liquidator {
             atas.iter().map(|(m, a)| (*m, *a)).collect()
         };
 
-        // TODO: optimize this, get all accounts in batch to have 1 single rpc call
-        let get_token_balance_futures = atas_snapshot
-            .iter()
-            .map(|(mint, ata)| get_token_balance(client, mint, ata));
-        let get_token_balance = futures::future::join_all(get_token_balance_futures).await;
+        // Batch fetch all mint and ATA accounts in single RPC calls
+        let mint_pubkeys: Vec<Pubkey> = atas_snapshot.iter().map(|(m, _)| *m).collect();
+        let ata_pubkeys: Vec<Pubkey> = atas_snapshot.iter().map(|(_, a)| *a).collect();
+
+        let mint_accounts = client.get_multiple_accounts(&mint_pubkeys).await?;
+        let ata_accounts = client.get_multiple_accounts(&ata_pubkeys).await?;
 
         for (i, (mint, ata)) in atas_snapshot.iter().enumerate() {
-            match get_token_balance.get(i) {
-                Some(Ok((balance, decimals))) => {
-                    let ui_balance = *balance as f64 / 10u64.pow(*decimals as u32) as f64;
+            let mint_account = mint_accounts.get(i).and_then(|a| a.as_ref());
+            let ata_account = ata_accounts.get(i).and_then(|a| a.as_ref());
+
+            match (mint_account, ata_account) {
+                (Some(mint_acc), Some(ata_acc)) => {
+                    let token_account = match TokenAccount::unpack(&ata_acc.data) {
+                        Ok(acc) => acc,
+                        Err(e) => {
+                            warn!("Error unpacking token account {:?}: {:?}", ata, e);
+                            continue;
+                        }
+                    };
+                    let mint_data = match Mint::try_deserialize_unchecked(&mut mint_acc.data.as_ref()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("Error deserializing mint {:?}: {:?}", mint, e);
+                            continue;
+                        }
+                    };
+                    let balance = token_account.amount;
+                    let decimals = mint_data.decimals;
+                    let ui_balance = balance as f64 / 10u64.pow(decimals as u32) as f64;
                     holdings.push(Holding {
                         mint: *mint,
                         ata: *ata,
-                        decimals: *decimals,
-                        balance: *balance,
+                        decimals,
+                        balance,
                         ui_balance,
                         label: label_of(mint, reserves),
-                        usd_value: if *balance > 0 {
+                        usd_value: if balance > 0 {
                             prices
                                 .prices
                                 .get(mint)
@@ -188,21 +221,16 @@ impl Liquidator {
                         },
                     });
                 }
-                Some(Err(e)) => {
-                    warn!(
-                        "Error getting balance for mint {:?} and ata {:?}: {:?}",
-                        mint, ata, e
-                    );
-                }
-                None => {
-                    warn!("No result for mint {:?} and ata {:?}", mint, ata);
+                _ => {
+                    // ATA doesn't exist yet, skip silently
                 }
             }
         }
 
         // Load SOL balance
-        let balance = client.get_balance(&self.wallet.pubkey()).await.unwrap();
+        let balance = client.get_balance(&self.wallet.pubkey()).await?;
         let ui_balance = balance as f64 / 10u64.pow(9) as f64;
+        let sol_price = prices.prices.get(&WRAPPED_SOL_MINT).copied().unwrap_or(0.0);
         let sol_holding = Holding {
             mint: Pubkey::default(), // No mint, this is the native balance
             ata: Pubkey::default(),  // Holding in the native account, not in the ata
@@ -210,7 +238,7 @@ impl Liquidator {
             balance,
             ui_balance,
             label: "SOL".to_string(),
-            usd_value: ui_balance * prices.prices.get(&WRAPPED_SOL_MINT).unwrap(),
+            usd_value: ui_balance * sol_price,
         };
         info!("Holding {} SOL", sol_holding.ui_balance);
 
@@ -249,10 +277,9 @@ async fn get_or_create_ata(
             .tx_builder()
             .add_ix(ix)
             .build(&[])
-            .await
-            .unwrap();
+            .await?;
 
-        let (sig, _) = client.send_and_confirm_transaction(tx).await.unwrap();
+        let (sig, _) = client.send_and_confirm_transaction(tx).await?;
 
         debug!(
             "Created ata for liquidator: {}, mint: {}, ata: {}, sig: {:?}",

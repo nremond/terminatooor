@@ -804,10 +804,34 @@ pub mod rpc {
             ..RpcProgramAccountsConfig::default()
         };
 
-        let accs = client
-            .client
-            .get_program_accounts_with_config(program_id, config)
-            .await?;
+        // Retry with exponential backoff for rate limiting
+        let mut retries = 0;
+        let max_retries = 5;
+        let accs = loop {
+            match client
+                .client
+                .get_program_accounts_with_config(program_id, config.clone())
+                .await
+            {
+                Ok(accs) => break accs,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("429") && retries < max_retries {
+                        retries += 1;
+                        let delay = std::time::Duration::from_millis(500 * (1 << retries));
+                        tracing::warn!(
+                            "Rate limited, retrying in {:?} (attempt {}/{})",
+                            delay,
+                            retries,
+                            max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
 
         let parsed_accounts = accs
             .into_iter()

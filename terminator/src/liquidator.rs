@@ -252,12 +252,21 @@ impl Liquidator {
 
             match (mint_account, ata_account) {
                 (Some(mint_acc), Some(ata_acc)) => {
-                    let token_account = match TokenAccount::unpack(&ata_acc.data) {
-                        Ok(acc) => acc,
-                        Err(e) => {
-                            warn!("Error unpacking token account {:?}: {:?}", ata, e);
-                            continue;
+                    // Try to unpack as SPL Token account
+                    // For Token-2022 accounts with extensions, data is longer than 165 bytes
+                    // but the base Account struct is the same, so we can read just the first 165 bytes
+                    let token_account = if ata_acc.data.len() >= 165 {
+                        match TokenAccount::unpack(&ata_acc.data[..165]) {
+                            Ok(acc) => acc,
+                            Err(e) => {
+                                // Might be uninitialized or invalid
+                                debug!("Error unpacking token account {:?}: {:?}", ata, e);
+                                continue;
+                            }
                         }
+                    } else {
+                        debug!("Token account {:?} data too short: {} bytes", ata, ata_acc.data.len());
+                        continue;
                     };
                     let mint_data = match Mint::try_deserialize_unchecked(&mut mint_acc.data.as_ref()) {
                         Ok(m) => m,

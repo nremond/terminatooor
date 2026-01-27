@@ -153,18 +153,31 @@ pub fn decide_liquidation_strategy(
 
     // Calculate expected collateral to receive (in collateral token lamports)
     // Collateral received = (debt_repaid * debt_price / coll_price) * (1 + liquidation_bonus_rate)
-    let debt_price = Fraction::from_bits(debt_liquidity.market_value_sf)
-        / Fraction::from_bits(debt_liquidity.borrowed_amount_sf);
-    let coll_price = Fraction::from_bits(coll_deposit.market_value_sf)
-        / Fraction::from_bits(coll_deposit.deposited_amount as u128);
+    let debt_mv = Fraction::from_bits(debt_liquidity.market_value_sf);
+    let debt_amt = Fraction::from_bits(debt_liquidity.borrowed_amount_sf);
+    let coll_mv = Fraction::from_bits(coll_deposit.market_value_sf);
+    let coll_amt = Fraction::from_num(coll_deposit.deposited_amount);
+
+    let debt_price = debt_mv / debt_amt;
+    let coll_price = coll_mv / coll_amt;
+
+    debug!(
+        "Price calc: debt_mv={}, debt_amt={}, debt_price={}, coll_mv={}, coll_amt={}, coll_price={}",
+        debt_mv, debt_amt, debt_price, coll_mv, coll_amt, coll_price
+    );
 
     // liquidation_bonus_rate is already a fraction (e.g., 0.05 for 5% bonus)
     let liquidation_bonus_multiplier = Fraction::from_num(1) + liquidation_bonus_rate;
 
-    let expected_collateral_value = Fraction::from_num(liquidatable_amount)
-        * debt_price
-        * liquidation_bonus_multiplier;
+    // Calculate expected collateral: (debt_to_repay * debt_price / coll_price) * (1 + bonus)
+    let debt_to_repay_value = Fraction::from_num(liquidatable_amount) * debt_price;
+    let expected_collateral_value = debt_to_repay_value * liquidation_bonus_multiplier;
     let expected_collateral_amount: u64 = (expected_collateral_value / coll_price).to_num();
+
+    debug!(
+        "Collateral calc: liquidatable_amount={}, debt_to_repay_value={}, expected_value={}, expected_amount={}",
+        liquidatable_amount, debt_to_repay_value, expected_collateral_value, expected_collateral_amount
+    );
 
     // Always use flash loans for maximum capital efficiency
     let decision = Some(LiquidationStrategy::FlashLoanLiquidate(

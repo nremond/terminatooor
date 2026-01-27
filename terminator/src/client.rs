@@ -795,6 +795,7 @@ pub mod rpc {
         for f in filters {
             all_filters.push(f.clone());
         }
+        let num_filters = all_filters.len();
         let config = RpcProgramAccountsConfig {
             filters: Some(all_filters),
             account_config: RpcAccountInfoConfig {
@@ -807,20 +808,38 @@ pub mod rpc {
         // Retry with exponential backoff for rate limiting
         let mut retries = 0;
         let max_retries = 5;
+        let type_name = std::any::type_name::<Acc>().split("::").last().unwrap_or("Unknown");
+        tracing::info!(
+            "RPC: getProgramAccounts for {} (size={} bytes, filters={})",
+            type_name,
+            size,
+            num_filters
+        );
+        let start = std::time::Instant::now();
         let accs = loop {
             match client
                 .client
                 .get_program_accounts_with_config(program_id, config.clone())
                 .await
             {
-                Ok(accs) => break accs,
+                Ok(accs) => {
+                    tracing::info!(
+                        "RPC: getProgramAccounts for {} completed in {:?}, got {} accounts",
+                        type_name,
+                        start.elapsed(),
+                        accs.len()
+                    );
+                    break accs;
+                }
                 Err(e) => {
                     let err_str = e.to_string();
                     if err_str.contains("429") && retries < max_retries {
                         retries += 1;
                         let delay = std::time::Duration::from_millis(500 * (1 << retries));
                         tracing::warn!(
-                            "Rate limited, retrying in {:?} (attempt {}/{})",
+                            "RPC: getProgramAccounts for {} rate limited after {:?}, retrying in {:?} (attempt {}/{})",
+                            type_name,
+                            start.elapsed(),
                             delay,
                             retries,
                             max_retries

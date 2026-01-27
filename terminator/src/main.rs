@@ -719,7 +719,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             println!("Instruction: {:?} {:?}", ix.program_id, ix.data);
         }
 
-        let should_send = false;
+        let should_send = true;
 
         if should_send {
             let sig = klend_client

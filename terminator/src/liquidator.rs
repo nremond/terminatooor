@@ -179,12 +179,7 @@ impl Liquidator {
                 ixs.len()
             );
 
-            let tx = client
-                .client
-                .tx_builder()
-                .add_ixs(ixs)
-                .build(&[])
-                .await?;
+            let tx = client.client.create_tx(&ixs, &[]).await?;
 
             match client.send_and_confirm_transaction(tx).await {
                 Ok((sig, _)) => {

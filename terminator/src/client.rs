@@ -75,9 +75,15 @@ impl KlendClient {
         program_id: Pubkey,
         rebalance_config: Option<RebalanceConfig>,
     ) -> Result<Self> {
-        // Create a dumb one first
+        // Use the payer keypair from OrbitLink, or create a dummy one for read-only operations
+        let wallet = client
+            .payer()
+            .ok()
+            .map(|k| Arc::new(k.insecure_clone()))
+            .unwrap_or_else(|| Arc::new(Keypair::new()));
+
         let liquidator = Liquidator {
-            wallet: Arc::new(Keypair::new()),
+            wallet,
             atas: RwLock::new(HashMap::new()),
         };
 

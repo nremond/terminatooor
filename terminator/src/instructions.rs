@@ -293,3 +293,111 @@ pub fn maybe_null_pk(pubkey: Pubkey) -> Option<Pubkey> {
         Some(pubkey)
     }
 }
+
+/// Create a flash borrow instruction to borrow liquidity from a reserve
+#[allow(clippy::too_many_arguments)]
+pub fn flash_borrow_reserve_liquidity_ix(
+    program_id: &Pubkey,
+    lending_market: &Pubkey,
+    reserve: &StateWithKey<Reserve>,
+    user_destination_liquidity: &Pubkey,
+    liquidator: &Liquidator,
+    liquidity_amount: u64,
+    referrer_token_state: Option<Pubkey>,
+    referrer_account: Option<Pubkey>,
+) -> InstructionBlocks {
+    let lending_market_authority =
+        kamino_lending::utils::seeds::pda::lending_market_auth(lending_market);
+
+    let reserve_state = reserve.state.borrow();
+
+    let instruction = Instruction {
+        program_id: *program_id,
+        accounts: kamino_lending::accounts::FlashBorrowReserveLiquidity {
+            user_transfer_authority: liquidator.wallet.pubkey(),
+            lending_market_authority,
+            lending_market: *lending_market,
+            reserve: reserve.key,
+            reserve_liquidity_mint: reserve_state.liquidity.mint_pubkey,
+            reserve_source_liquidity: reserve_state.liquidity.supply_vault,
+            user_destination_liquidity: *user_destination_liquidity,
+            reserve_liquidity_fee_receiver: reserve_state.liquidity.fee_vault,
+            referrer_token_state,
+            referrer_account,
+            sysvar_info: sysvar::instructions::ID,
+            token_program: Token::id(),
+        }
+        .to_account_metas(None),
+        data: kamino_lending::instruction::FlashBorrowReserveLiquidity { liquidity_amount }.data(),
+    };
+
+    InstructionBlocks {
+        instruction,
+        payer: liquidator.wallet.pubkey(),
+        signers: vec![liquidator.wallet.clone()],
+    }
+}
+
+/// Create a flash repay instruction to repay a flash loan
+#[allow(clippy::too_many_arguments)]
+pub fn flash_repay_reserve_liquidity_ix(
+    program_id: &Pubkey,
+    lending_market: &Pubkey,
+    reserve: &StateWithKey<Reserve>,
+    user_source_liquidity: &Pubkey,
+    liquidator: &Liquidator,
+    liquidity_amount: u64,
+    borrow_instruction_index: u8,
+    referrer_token_state: Option<Pubkey>,
+    referrer_account: Option<Pubkey>,
+) -> InstructionBlocks {
+    let lending_market_authority =
+        kamino_lending::utils::seeds::pda::lending_market_auth(lending_market);
+
+    let reserve_state = reserve.state.borrow();
+
+    let instruction = Instruction {
+        program_id: *program_id,
+        accounts: kamino_lending::accounts::FlashRepayReserveLiquidity {
+            user_transfer_authority: liquidator.wallet.pubkey(),
+            lending_market_authority,
+            lending_market: *lending_market,
+            reserve: reserve.key,
+            reserve_liquidity_mint: reserve_state.liquidity.mint_pubkey,
+            user_source_liquidity: *user_source_liquidity,
+            reserve_destination_liquidity: reserve_state.liquidity.supply_vault,
+            reserve_liquidity_fee_receiver: reserve_state.liquidity.fee_vault,
+            referrer_token_state,
+            referrer_account,
+            sysvar_info: sysvar::instructions::ID,
+            token_program: Token::id(),
+        }
+        .to_account_metas(None),
+        data: kamino_lending::instruction::FlashRepayReserveLiquidity {
+            liquidity_amount,
+            borrow_instruction_index,
+        }
+        .data(),
+    };
+
+    InstructionBlocks {
+        instruction,
+        payer: liquidator.wallet.pubkey(),
+        signers: vec![liquidator.wallet.clone()],
+    }
+}
+
+/// Calculate the flash loan repay amount including fees
+pub fn calculate_flash_loan_repay_amount(reserve: &Reserve, borrow_amount: u64) -> u64 {
+    let flash_loan_fee_sf = reserve.config.fees.flash_loan_fee_sf;
+    if flash_loan_fee_sf == u64::MAX {
+        // Flash loans disabled
+        return 0;
+    }
+
+    // Fee calculation: repay = borrow + (borrow * fee_sf / FRACTION_ONE_SF)
+    // FRACTION_ONE_SF = 2^60 (from kamino_lending)
+    const FRACTION_ONE_SF: u128 = 1u128 << 60;
+    let fee = (borrow_amount as u128 * flash_loan_fee_sf as u128) / FRACTION_ONE_SF;
+    borrow_amount + fee as u64
+}

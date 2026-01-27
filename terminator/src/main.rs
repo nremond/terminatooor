@@ -561,12 +561,16 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         holdings,
     )?;
 
-    let (swap_amount, liquidate_amount) = match liquidation_strategy {
-        Some(LiquidationStrategy::LiquidateAndRedeem(liquidate_amount)) => (0, liquidate_amount),
-        Some(LiquidationStrategy::SwapThenLiquidate(swap_amount, liquidate_amount)) => {
-            (swap_amount, liquidate_amount)
+    let (liquidate_amount, expected_collateral) = match liquidation_strategy {
+        Some(LiquidationStrategy::FlashLoanLiquidate(liquidate_amount, expected_collateral)) => {
+            (liquidate_amount, expected_collateral)
         }
-        None => (0, 0),
+        Some(LiquidationStrategy::LiquidateAndRedeem(liquidate_amount)) => (liquidate_amount, 0),
+        Some(LiquidationStrategy::SwapThenLiquidate(_, liquidate_amount)) => (liquidate_amount, 0),
+        None => {
+            info!("No liquidation strategy available");
+            return Ok(());
+        }
     };
 
     // Simulate liquidation
@@ -586,16 +590,52 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
     if res.is_ok() {
         let user = klend_client.liquidator.wallet.pubkey();
-        let base_mint = &rebalance_config.base_token;
+        let coll_mint = coll_reserve.state.borrow().liquidity.mint_pubkey;
 
         let mut ixns = vec![];
         let mut luts = vec![];
 
-        if swap_amount > 0 {
+        // Get user's ATA for debt token
+        let debt_token_ata = {
+            let atas = klend_client.liquidator.atas.read().unwrap();
+            *atas.get(&debt_mint).unwrap()
+        };
+
+        // 1. Flash borrow the debt token
+        let flash_borrow_ix = instructions::flash_borrow_reserve_liquidity_ix(
+            &klend_client.program_id,
+            &lending_market.key,
+            &debt_reserve,
+            &debt_token_ata,
+            &klend_client.liquidator,
+            liquidate_amount,
+            None, // referrer_token_state
+            None, // referrer_account
+        );
+        ixns.push(flash_borrow_ix.instruction);
+        let flash_borrow_index = 0u8; // Will be adjusted after compute budget ixns
+
+        // 2. Liquidation instructions (includes refresh)
+        let liquidate_ixns = klend_client
+            .liquidate_obligation_and_redeem_reserve_collateral_ixns(
+                lending_market.clone(),
+                debt_reserve.clone(),
+                coll_reserve.clone(),
+                obligation.clone(),
+                liquidate_amount,
+                min_acceptable_received_collateral_amount,
+                max_allowed_ltv_override_pct_opt,
+            )
+            .await
+            .unwrap();
+        ixns.extend_from_slice(&liquidate_ixns);
+
+        // 3. Swap collateral back to debt token (if they're different)
+        if coll_mint != debt_mint && expected_collateral > 0 {
             let swap_result = get_best_swap_instructions(
-                base_mint,
+                &coll_mint,
                 &debt_mint,
-                swap_amount,
+                expected_collateral,
                 false,
                 Some((liquidation_swap_slippage_pct * 100.0) as u16),
                 None,
@@ -609,16 +649,16 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
             let DecompiledVersionedTx {
                 lookup_tables,
-                instructions: jup_ixs,
+                instructions: swap_ixs,
             } = swap_result;
 
             // Filter compute budget ixns
-            let jup_ixs = jup_ixs
+            let swap_ixs = swap_ixs
                 .into_iter()
                 .filter(|ix| ix.program_id != compute_budget::id())
                 .collect_vec();
 
-            ixns.extend_from_slice(&jup_ixs);
+            ixns.extend_from_slice(&swap_ixs);
 
             if let Some(lookup_tables) = lookup_tables {
                 for table in lookup_tables.into_iter() {
@@ -627,21 +667,33 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             }
         }
 
-        let liquidate_ixns = klend_client
-            .liquidate_obligation_and_redeem_reserve_collateral_ixns(
-                lending_market,
-                debt_reserve,
-                coll_reserve,
-                obligation,
-                liquidate_amount,
-                min_acceptable_received_collateral_amount,
-                max_allowed_ltv_override_pct_opt,
-            )
-            .await
-            .unwrap();
-        ixns.extend_from_slice(&liquidate_ixns);
+        // 4. Flash repay (borrowed amount + fee)
+        let repay_amount = instructions::calculate_flash_loan_repay_amount(
+            &debt_reserve.state.borrow(),
+            liquidate_amount,
+        );
+        let flash_repay_ix = instructions::flash_repay_reserve_liquidity_ix(
+            &klend_client.program_id,
+            &lending_market.key,
+            &debt_reserve,
+            &debt_token_ata,
+            &klend_client.liquidator,
+            repay_amount,
+            flash_borrow_index,
+            None, // referrer_token_state
+            None, // referrer_account
+        );
+        ixns.push(flash_repay_ix.instruction);
 
-        // TODO: add compute budget + prio fees
+        info!(
+            "Flash loan liquidation: borrow={}, repay={} (fee={}), expected_collateral={}",
+            liquidate_amount,
+            repay_amount,
+            repay_amount - liquidate_amount,
+            expected_collateral
+        );
+
+        // Build transaction
         let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
         for lut in luts {
             txn = txn.add_lookup_table(lut);

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
-use anchor_lang::{prelude::Pubkey, solana_program};
+use anchor_lang::prelude::Pubkey;
 use anyhow::{anyhow, Result};
 use orbit_link::OrbitLink;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;

@@ -7,7 +7,8 @@ use anyhow::{anyhow, Result};
 use kamino_lending::Reserve;
 use solana_sdk::{signature::Keypair, signer::Signer};
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account,
+    get_associated_token_address, get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account,
 };
 use spl_token::state::Account as TokenAccount;
 use tracing::{debug, info, warn};
@@ -128,10 +129,25 @@ impl Liquidator {
 
         let owner_pubkey = self.wallet.pubkey();
 
-        // Calculate all ATA addresses
+        // Fetch mint accounts to determine which token program each uses
+        let mut mint_token_programs: HashMap<Pubkey, Pubkey> = HashMap::new();
+        for chunk in mints.chunks(100) {
+            let accounts = client.client.client.get_multiple_accounts(chunk).await?;
+            for (i, account) in accounts.iter().enumerate() {
+                if let Some(acc) = account {
+                    // The owner of the mint account tells us which token program it uses
+                    mint_token_programs.insert(chunk[i], acc.owner);
+                }
+            }
+        }
+
+        // Calculate all ATA addresses using the correct token program for each mint
         let ata_addresses: Vec<Pubkey> = mints
             .iter()
-            .map(|mint| get_associated_token_address(&owner_pubkey, mint))
+            .map(|mint| {
+                let token_program = mint_token_programs.get(mint).copied().unwrap_or(Token::id());
+                get_associated_token_address_with_program_id(&owner_pubkey, mint, &token_program)
+            })
             .collect();
 
         // Batch check which ATAs already exist (100 per RPC call)
@@ -145,12 +161,15 @@ impl Liquidator {
             }
         }
 
-        // Find mints that need ATA creation
-        let mints_needing_ata: Vec<&Pubkey> = mints
+        // Find mints that need ATA creation (with their token program)
+        let mints_needing_ata: Vec<(&Pubkey, Pubkey)> = mints
             .iter()
             .enumerate()
             .filter(|(i, _)| !existing_atas.contains(&ata_addresses[*i]))
-            .map(|(_, mint)| mint)
+            .map(|(_, mint)| {
+                let token_program = mint_token_programs.get(mint).copied().unwrap_or(Token::id());
+                (mint, token_program)
+            })
             .collect();
 
         info!(
@@ -168,8 +187,8 @@ impl Liquidator {
 
             let ixs: Vec<_> = chunk
                 .iter()
-                .map(|mint| {
-                    create_associated_token_account(&owner_pubkey, &owner_pubkey, mint, &Token::id())
+                .map(|(mint, token_program)| {
+                    create_associated_token_account(&owner_pubkey, &owner_pubkey, mint, token_program)
                 })
                 .collect();
 

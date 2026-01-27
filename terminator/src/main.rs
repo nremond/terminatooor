@@ -71,9 +71,9 @@ pub struct Args {
     #[clap(long, env, parse(from_os_str))]
     keypair: Option<PathBuf>,
 
-    /// Markets to be considered
-    /// Defaults to using api endpoint if not specified
-    #[clap(long, env, parse(try_from_str))]
+    /// Markets to be considered (CLI only, use MARKETS env var for comma-separated list)
+    /// Defaults to using MARKETS env var or fetching dynamically
+    #[clap(long, parse(try_from_str))]
     markets: Option<Vec<Pubkey>>,
 
     /// Set flag to activate json log output

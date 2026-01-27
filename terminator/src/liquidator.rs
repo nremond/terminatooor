@@ -124,36 +124,87 @@ impl Liquidator {
             return Ok(());
         }
 
-        info!("Creating ATAs for {} new mints...", mints.len());
+        info!("Ensuring ATAs for {} new mints...", mints.len());
 
-        // Process in batches to avoid rate limiting
-        const BATCH_SIZE: usize = 10;
-        let mut all_results = Vec::with_capacity(mints.len());
+        let owner_pubkey = self.wallet.pubkey();
 
-        for (batch_idx, chunk) in mints.chunks(BATCH_SIZE).enumerate() {
-            if batch_idx > 0 {
-                // Add delay between batches to avoid rate limiting
-                tokio::time::sleep(Duration::from_millis(500)).await;
+        // Calculate all ATA addresses
+        let ata_addresses: Vec<Pubkey> = mints
+            .iter()
+            .map(|mint| get_associated_token_address(&owner_pubkey, mint))
+            .collect();
+
+        // Batch check which ATAs already exist (100 per RPC call)
+        let mut existing_atas = std::collections::HashSet::new();
+        for chunk in ata_addresses.chunks(100) {
+            let accounts = client.client.client.get_multiple_accounts(chunk).await?;
+            for (i, account) in accounts.iter().enumerate() {
+                if account.is_some() {
+                    existing_atas.insert(chunk[i]);
+                }
             }
-
-            let futures = chunk
-                .iter()
-                .map(|mint| get_or_create_ata(client, &self.wallet, mint));
-            let batch_results = futures::future::join_all(futures).await;
-            all_results.extend(batch_results);
         }
 
-        let mut atas = self.atas.write().unwrap();
-        for (i, result) in all_results.into_iter().enumerate() {
-            let mint = mints[i];
-            match result {
-                Ok(ata) => {
-                    atas.insert(mint, ata);
+        // Find mints that need ATA creation
+        let mints_needing_ata: Vec<&Pubkey> = mints
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !existing_atas.contains(&ata_addresses[*i]))
+            .map(|(_, mint)| mint)
+            .collect();
+
+        info!(
+            "Found {} existing ATAs, need to create {} new ones",
+            existing_atas.len(),
+            mints_needing_ata.len()
+        );
+
+        // Batch create ATAs (up to 15 per transaction to fit in tx size limit)
+        const CREATE_BATCH_SIZE: usize = 15;
+        for (batch_idx, chunk) in mints_needing_ata.chunks(CREATE_BATCH_SIZE).enumerate() {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let ixs: Vec<_> = chunk
+                .iter()
+                .map(|mint| {
+                    create_associated_token_account(&owner_pubkey, &owner_pubkey, mint, &Token::id())
+                })
+                .collect();
+
+            info!(
+                "Creating ATAs batch {}: {} accounts",
+                batch_idx + 1,
+                ixs.len()
+            );
+
+            let tx = client
+                .client
+                .tx_builder()
+                .add_ixs(ixs)
+                .build(&[])
+                .await?;
+
+            match client.send_and_confirm_transaction(tx).await {
+                Ok((sig, _)) => {
+                    debug!("Created {} ATAs in tx: {:?}", chunk.len(), sig);
                 }
                 Err(e) => {
-                    warn!("Failed to create ATA for mint {}: {:?}", mint, e);
+                    warn!("Failed to create ATA batch {}: {:?}", batch_idx + 1, e);
                 }
             }
+
+            // Small delay between batches
+            if batch_idx > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        // Store all ATAs (both existing and newly created)
+        let mut atas = self.atas.write().unwrap();
+        for (i, mint) in mints.iter().enumerate() {
+            atas.insert(*mint, ata_addresses[i]);
         }
 
         info!("Liquidator now has {} token ATAs", atas.len());

@@ -159,8 +159,8 @@ impl Liquidator {
             mints_needing_ata.len()
         );
 
-        // Batch create ATAs (up to 15 per transaction to fit in tx size limit)
-        const CREATE_BATCH_SIZE: usize = 15;
+        // Batch create ATAs (up to 5 per transaction to fit in tx size limit of 1232 bytes)
+        const CREATE_BATCH_SIZE: usize = 5;
         for (batch_idx, chunk) in mints_needing_ata.chunks(CREATE_BATCH_SIZE).enumerate() {
             if chunk.is_empty() {
                 continue;

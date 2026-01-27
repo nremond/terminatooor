@@ -151,32 +151,59 @@ pub fn decide_liquidation_strategy(
         return Ok(None);
     }
 
-    // Calculate expected collateral to receive (in collateral token lamports)
-    // Collateral received = (debt_repaid * debt_price / coll_price) * (1 + liquidation_bonus_rate)
+    // Calculate expected collateral to receive (in underlying collateral token lamports)
+    // The coll_deposit.deposited_amount is in cTokens, but we receive underlying tokens
+    // after liquidation. We need to use the collateral reserve's exchange rate.
+    let coll_reserve_state = coll_reserve.state.borrow();
+
+    // Get the collateral exchange rate: how many underlying tokens per cToken
+    // exchange_rate = (available_liquidity + borrowed_liquidity) / ctoken_supply
+    let total_liquidity = Fraction::from_num(coll_reserve_state.liquidity.available_amount)
+        + Fraction::from_bits(coll_reserve_state.liquidity.borrowed_amount_sf);
+    let ctoken_supply = Fraction::from_num(coll_reserve_state.collateral.mint_total_supply);
+    let exchange_rate = if ctoken_supply > Fraction::ZERO {
+        total_liquidity / ctoken_supply
+    } else {
+        Fraction::from_num(1)
+    };
+
+    // Calculate the underlying collateral amount from cTokens
+    let coll_ctokens = Fraction::from_num(coll_deposit.deposited_amount);
+    let coll_underlying_amount = coll_ctokens * exchange_rate;
+    let coll_mv = Fraction::from_bits(coll_deposit.market_value_sf);
+
+    // Price per underlying lamport
+    let coll_underlying_price = if coll_underlying_amount > Fraction::ZERO {
+        coll_mv / coll_underlying_amount
+    } else {
+        Fraction::ZERO
+    };
+
+    // Debt price per lamport
     let debt_mv = Fraction::from_bits(debt_liquidity.market_value_sf);
     let debt_amt = Fraction::from_bits(debt_liquidity.borrowed_amount_sf);
-    let coll_mv = Fraction::from_bits(coll_deposit.market_value_sf);
-    let coll_amt = Fraction::from_num(coll_deposit.deposited_amount);
-
     let debt_price = debt_mv / debt_amt;
-    let coll_price = coll_mv / coll_amt;
 
     debug!(
-        "Price calc: debt_mv={}, debt_amt={}, debt_price={}, coll_mv={}, coll_amt={}, coll_price={}",
-        debt_mv, debt_amt, debt_price, coll_mv, coll_amt, coll_price
+        "Price calc: debt_mv={}, debt_amt={}, debt_price={}, coll_mv={}, coll_underlying={}, coll_price={}, exchange_rate={}",
+        debt_mv, debt_amt, debt_price, coll_mv, coll_underlying_amount, coll_underlying_price, exchange_rate
     );
 
     // liquidation_bonus_rate is already a fraction (e.g., 0.05 for 5% bonus)
     let liquidation_bonus_multiplier = Fraction::from_num(1) + liquidation_bonus_rate;
 
-    // Calculate expected collateral: (debt_to_repay * debt_price / coll_price) * (1 + bonus)
-    let debt_to_repay_value = Fraction::from_num(liquidatable_amount) * debt_price;
-    let expected_collateral_value = debt_to_repay_value * liquidation_bonus_multiplier;
-    let expected_collateral_amount: u64 = (expected_collateral_value / coll_price).to_num();
+    // Calculate expected collateral: (debt_to_repay_usd * (1 + bonus)) / coll_price_per_lamport
+    let debt_to_repay_usd = Fraction::from_num(liquidatable_amount) * debt_price;
+    let expected_collateral_usd = debt_to_repay_usd * liquidation_bonus_multiplier;
+    let expected_collateral_amount: u64 = if coll_underlying_price > Fraction::ZERO {
+        (expected_collateral_usd / coll_underlying_price).to_num()
+    } else {
+        0
+    };
 
     debug!(
-        "Collateral calc: liquidatable_amount={}, debt_to_repay_value={}, expected_value={}, expected_amount={}",
-        liquidatable_amount, debt_to_repay_value, expected_collateral_value, expected_collateral_amount
+        "Collateral calc: liquidatable_amount={}, debt_to_repay_usd={}, expected_usd={}, expected_amount={}",
+        liquidatable_amount, debt_to_repay_usd, expected_collateral_usd, expected_collateral_amount
     );
 
     // Always use flash loans for maximum capital efficiency

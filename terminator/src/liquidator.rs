@@ -258,14 +258,14 @@ impl Liquidator {
                     let token_account = if ata_acc.data.len() >= 165 {
                         match TokenAccount::unpack(&ata_acc.data[..165]) {
                             Ok(acc) => acc,
-                            Err(e) => {
-                                // Might be uninitialized or invalid
-                                debug!("Error unpacking token account {:?}: {:?}", ata, e);
+                            Err(_) => {
+                                // Likely uninitialized (ATA exists but never received tokens)
+                                // Balance is 0, skip silently
                                 continue;
                             }
                         }
                     } else {
-                        debug!("Token account {:?} data too short: {} bytes", ata, ata_acc.data.len());
+                        // Data too short - account is invalid or uninitialized
                         continue;
                     };
                     let mint_data = match Mint::try_deserialize_unchecked(&mut mint_acc.data.as_ref()) {

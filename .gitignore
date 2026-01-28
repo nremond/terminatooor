@@ -30,3 +30,4 @@ rust_liquidator.json
 .DS_store
 .claude
 
+launch-terminator.sh

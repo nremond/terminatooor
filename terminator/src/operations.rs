@@ -204,7 +204,9 @@ pub async fn refresh_reserves_and_obligation(
 
     // Refresh reserves and obligation
     {
-        let debt_reserve_state = reserves.get_mut(debt_res_key).unwrap();
+        let debt_reserve_state = reserves
+            .get_mut(debt_res_key)
+            .ok_or_else(|| anyhow::anyhow!("Debt reserve {} not found in reserves", debt_res_key))?;
         refresh_reserve(
             debt_res_key,
             debt_reserve_state,
@@ -217,7 +219,9 @@ pub async fn refresh_reserves_and_obligation(
     }
 
     {
-        let coll_reserve_state = reserves.get_mut(coll_res_key).unwrap();
+        let coll_reserve_state = reserves
+            .get_mut(coll_res_key)
+            .ok_or_else(|| anyhow::anyhow!("Collateral reserve {} not found in reserves", coll_res_key))?;
         refresh_reserve(
             coll_res_key,
             coll_reserve_state,

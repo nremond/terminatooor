@@ -613,7 +613,9 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             None, // referrer_account
         );
         ixns.push(flash_borrow_ix.instruction);
-        let flash_borrow_index = 0u8; // Will be adjusted after compute budget ixns
+        // build_with_budget_and_fee prepends 2 ComputeBudget instructions (SetComputeUnitLimit, SetComputeUnitPrice)
+        // so our flash_borrow instruction which is at index 0 in ixns will be at index 2 in the final transaction
+        let flash_borrow_index = 2u8;
 
         // 2. Liquidation instructions (includes refresh)
         let liquidate_ixns = klend_client
@@ -722,14 +724,19 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         let should_send = true;
 
         if should_send {
-            let sig = klend_client
+            match klend_client
                 .client
                 .send_retry_and_confirm_transaction(txn, None, false)
                 .await
-                .unwrap();
-
-            info!("Liquidation tx sent: {:?}", sig.0);
-            info!("Liquidation tx res: {:?}", sig.1);
+            {
+                Ok(sig) => {
+                    info!("Liquidation tx sent: {:?}", sig.0);
+                    info!("Liquidation tx res: {:?}", sig.1);
+                }
+                Err(e) => {
+                    warn!("Liquidation tx failed: {:?}", e);
+                }
+            }
         }
     }
     Ok(())

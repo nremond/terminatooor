@@ -401,3 +401,38 @@ pub fn calculate_flash_loan_repay_amount(reserve: &Reserve, borrow_amount: u64) 
     let fee = (borrow_amount as u128 * flash_loan_fee_sf as u128) / FRACTION_ONE_SF;
     borrow_amount + fee as u64
 }
+
+/// Number of ComputeBudget instructions prepended by build_with_budget_and_fee
+/// This is used to calculate the correct instruction index for flash loan repay
+pub const COMPUTE_BUDGET_IX_COUNT: u8 = 2;
+
+/// Calculate the flash borrow instruction index in the final transaction
+/// The flash borrow is at index 0 in our instruction list, but build_with_budget_and_fee
+/// prepends COMPUTE_BUDGET_IX_COUNT instructions (SetComputeUnitLimit, SetComputeUnitPrice)
+pub fn flash_borrow_instruction_index(base_index: u8) -> u8 {
+    base_index + COMPUTE_BUDGET_IX_COUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flash_borrow_instruction_index() {
+        // When flash_borrow is the first instruction in our list (index 0),
+        // it should be at index 2 in the final transaction after ComputeBudget ixs
+        assert_eq!(flash_borrow_instruction_index(0), 2);
+
+        // Verify the constant matches what OrbitLink's build_with_budget_and_fee prepends:
+        // - SetComputeUnitLimit (index 0)
+        // - SetComputeUnitPrice (index 1)
+        assert_eq!(COMPUTE_BUDGET_IX_COUNT, 2);
+    }
+
+    #[test]
+    fn test_flash_borrow_index_with_offset() {
+        // If we had other instructions before flash_borrow
+        assert_eq!(flash_borrow_instruction_index(1), 3);
+        assert_eq!(flash_borrow_instruction_index(5), 7);
+    }
+}

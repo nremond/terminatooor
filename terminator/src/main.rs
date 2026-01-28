@@ -613,9 +613,8 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             None, // referrer_account
         );
         ixns.push(flash_borrow_ix.instruction);
-        // build_with_budget_and_fee prepends 2 ComputeBudget instructions (SetComputeUnitLimit, SetComputeUnitPrice)
-        // so our flash_borrow instruction which is at index 0 in ixns will be at index 2 in the final transaction
-        let flash_borrow_index = 2u8;
+        // Flash borrow is at index 0 in our list, but build_with_budget_and_fee prepends ComputeBudget ixs
+        let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
         // 2. Liquidation instructions (includes refresh)
         let liquidate_ixns = klend_client

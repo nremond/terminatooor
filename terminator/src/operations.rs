@@ -183,8 +183,8 @@ pub fn split_obligations(obligations: &[(Pubkey, Obligation)]) -> SplitObligatio
 #[allow(clippy::too_many_arguments)]
 pub async fn refresh_reserves_and_obligation(
     klend_client: &KlendClient,
-    debt_res_key: &Pubkey,
-    coll_res_key: &Pubkey,
+    _debt_res_key: &Pubkey,
+    _coll_res_key: &Pubkey,
     obligation_addr: &Pubkey,
     obligation_state: &mut Obligation,
     reserves: &mut HashMap<Pubkey, Reserve>,
@@ -202,35 +202,34 @@ pub async fn refresh_reserves_and_obligation(
     let switchboard_feed_infos = map_accounts_and_create_infos(&mut switchboard_accounts);
     let scope_price_infos = map_accounts_and_create_infos(&mut scope_price_accounts);
 
-    // Refresh reserves and obligation
-    {
-        let debt_reserve_state = reserves
-            .get_mut(debt_res_key)
-            .ok_or_else(|| anyhow::anyhow!("Debt reserve {} not found in reserves", debt_res_key))?;
-        refresh_reserve(
-            debt_res_key,
-            debt_reserve_state,
-            lending_market,
-            clock,
-            &pyth_account_infos,
-            &switchboard_feed_infos,
-            &scope_price_infos,
-        )?;
+    // Collect all unique reserve keys from the obligation (deposits + borrows)
+    let mut all_reserve_keys: Vec<Pubkey> = Vec::new();
+    for deposit in obligation_state.deposits.iter() {
+        if deposit.deposit_reserve != Pubkey::default() && !all_reserve_keys.contains(&deposit.deposit_reserve) {
+            all_reserve_keys.push(deposit.deposit_reserve);
+        }
+    }
+    for borrow in obligation_state.borrows.iter() {
+        if borrow.borrow_reserve != Pubkey::default() && !all_reserve_keys.contains(&borrow.borrow_reserve) {
+            all_reserve_keys.push(borrow.borrow_reserve);
+        }
     }
 
-    {
-        let coll_reserve_state = reserves
-            .get_mut(coll_res_key)
-            .ok_or_else(|| anyhow::anyhow!("Collateral reserve {} not found in reserves", coll_res_key))?;
-        refresh_reserve(
-            coll_res_key,
-            coll_reserve_state,
-            lending_market,
-            clock,
-            &pyth_account_infos,
-            &switchboard_feed_infos,
-            &scope_price_infos,
-        )?;
+    // Refresh ALL reserves referenced by the obligation (required by Kamino protocol)
+    for reserve_key in &all_reserve_keys {
+        if let Some(reserve_state) = reserves.get_mut(reserve_key) {
+            refresh_reserve(
+                reserve_key,
+                reserve_state,
+                lending_market,
+                clock,
+                &pyth_account_infos,
+                &switchboard_feed_infos,
+                &scope_price_infos,
+            )?;
+        } else {
+            return Err(anyhow::anyhow!("Reserve {} not found in reserves", reserve_key));
+        }
     }
 
     let ObligationReserves {

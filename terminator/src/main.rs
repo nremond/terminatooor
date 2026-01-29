@@ -521,8 +521,12 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     .await?;
 
     // Now it's all fully refreshed and up to date
-    let debt_reserve_state = *reserves.get(&debt_res_key).unwrap();
-    let coll_reserve_state = *reserves.get(&coll_res_key).unwrap();
+    let debt_reserve_state = *reserves.get(&debt_res_key).ok_or_else(|| {
+        anyhow::anyhow!("Debt reserve {} not found in reserves map", debt_res_key)
+    })?;
+    let coll_reserve_state = *reserves.get(&coll_res_key).ok_or_else(|| {
+        anyhow::anyhow!("Collateral reserve {} not found in reserves map", coll_res_key)
+    })?;
     let debt_mint = debt_reserve_state.liquidity.mint_pubkey;
     let debt_reserve = StateWithKey::new(debt_reserve_state, debt_res_key);
     let coll_reserve = StateWithKey::new(coll_reserve_state, coll_res_key);

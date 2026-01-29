@@ -30,10 +30,15 @@ pub async fn get_best_swap_route(
     )
     .await?;
 
-    let route_price_impact_pct = best_route
-        .price_impact_pct
-        .parse::<f32>()
-        .map_err(|_| TitanError::ResponseTypeConversionError)?;
+    // Handle empty or invalid price_impact_pct (Titan sometimes returns empty string)
+    let route_price_impact_pct = if best_route.price_impact_pct.is_empty() {
+        0.0
+    } else {
+        best_route
+            .price_impact_pct
+            .parse::<f32>()
+            .unwrap_or(0.0)
+    };
     if let Some(price_impact_limit) = price_impact_limit {
         if route_price_impact_pct > price_impact_limit {
             return Err(TitanError::PriceImpactTooHigh(route_price_impact_pct));

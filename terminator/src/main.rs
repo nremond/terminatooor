@@ -22,7 +22,7 @@ use crate::{
     client::{KlendClient, RebalanceConfig},
     config::get_lending_markets,
     geyser::{GeyserConfig, GeyserStream},
-    jupiter::get_best_swap_instructions,
+    routing::get_best_swap_instructions,
     liquidator::{Holding, Holdings},
     math::{LiquidationStrategy, Fraction},
     model::StateWithKey,
@@ -40,7 +40,7 @@ mod config;
 pub mod consts;
 pub mod geyser;
 pub mod instructions;
-pub mod jupiter;
+pub mod routing;
 pub mod liquidator;
 pub mod lookup_tables;
 pub mod macros;

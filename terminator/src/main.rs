@@ -490,6 +490,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         .fetch_market_and_reserves(&ob.lending_market)
         .await?;
     let mut reserves = market_accs.reserves;
+    info!("Fetched {} reserves for market {}", reserves.len(), ob.lending_market);
 
     // Ensure ATAs exist for all reserve mints before liquidation
     klend_client
@@ -503,8 +504,18 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     let clock = sysvars::clock(&klend_client.client.client).await;
 
     // Pick debt and coll reserves to liquidate
-    let debt_res_key = ob.borrows[0].borrow_reserve;
-    let coll_res_key = ob.deposits[0].deposit_reserve;
+    // Find the first non-empty borrow and deposit (there can be gaps in the arrays)
+    let debt_res_key = ob.borrows
+        .iter()
+        .find(|b| b.borrow_reserve != Pubkey::default())
+        .ok_or_else(|| anyhow::anyhow!("No valid borrow reserves in obligation"))?
+        .borrow_reserve;
+    let coll_res_key = ob.deposits
+        .iter()
+        .find(|d| d.deposit_reserve != Pubkey::default())
+        .ok_or_else(|| anyhow::anyhow!("No valid deposit reserves in obligation"))?
+        .deposit_reserve;
+    info!("Selected debt_reserve={} coll_reserve={}", debt_res_key, coll_res_key);
 
     // Refresh reserves and obligation
     operations::refresh_reserves_and_obligation(
@@ -522,10 +533,18 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
     // Now it's all fully refreshed and up to date
     let debt_reserve_state = *reserves.get(&debt_res_key).ok_or_else(|| {
-        anyhow::anyhow!("Debt reserve {} not found in reserves map", debt_res_key)
+        let reserve_keys: Vec<_> = reserves.keys().collect();
+        anyhow::anyhow!(
+            "Debt reserve {} not found in reserves map. Available reserves ({}):\n{:?}",
+            debt_res_key, reserves.len(), reserve_keys
+        )
     })?;
     let coll_reserve_state = *reserves.get(&coll_res_key).ok_or_else(|| {
-        anyhow::anyhow!("Collateral reserve {} not found in reserves map", coll_res_key)
+        let reserve_keys: Vec<_> = reserves.keys().collect();
+        anyhow::anyhow!(
+            "Collateral reserve {} not found in reserves map. Available reserves ({}):\n{:?}",
+            coll_res_key, reserves.len(), reserve_keys
+        )
     })?;
     let debt_mint = debt_reserve_state.liquidity.mint_pubkey;
     let debt_reserve = StateWithKey::new(debt_reserve_state, debt_res_key);
@@ -1181,3 +1200,6 @@ fn deserialize_obligation(data: &[u8]) -> Option<Obligation> {
         Err(_) => None,
     }
 }
+
+// Integration tests moved to titan.rs for now due to complex dependencies
+// TODO: Add reserve lookup test when we figure out the KlendClient initialization

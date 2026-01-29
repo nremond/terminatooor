@@ -1381,4 +1381,262 @@ mod tests {
             }
         }
     }
+
+    /// Test price impact with large swap (10000 SOL)
+    /// Run with: cargo test test_price_impact -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_price_impact() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .init();
+
+        let config = TitanConfig::from_env().expect("TITAN_ENDPOINT must be set");
+        let client = TitanClient::new(config);
+
+        let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().unwrap();
+        let usdc_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
+
+        use solana_sdk::signer::Signer;
+        let user_pubkey: Pubkey = std::env::var("KEYPAIR_PATH")
+            .ok()
+            .and_then(|path| {
+                let data = std::fs::read_to_string(&path).ok()?;
+                let bytes: Vec<u8> = serde_json::from_str(&data).ok()?;
+                solana_sdk::signature::Keypair::from_bytes(&bytes).ok()
+            })
+            .map(|kp| kp.pubkey())
+            .unwrap_or_else(|| {
+                "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1".parse().unwrap()
+            });
+
+        println!("\n=== Testing Price Impact ===");
+
+        // Test with 10000 SOL - should have noticeable price impact
+        let large_amount = 10_000_000_000_000u64; // 10000 SOL
+        println!("\n--- Large swap: 10000 SOL -> USDC ---");
+        match client
+            .get_quote(&sol_mint, &usdc_mint, large_amount, Some(50), false, Some(58), user_pubkey)
+            .await
+        {
+            Ok((route, _instructions)) => {
+                println!("SUCCESS:");
+                println!("  in_amount: {} SOL", route.in_amount as f64 / 1e9);
+                println!("  out_amount: {} USDC", route.out_amount as f64 / 1e6);
+                println!("  price_impact_pct: '{}'", route.price_impact_pct);
+                println!("  price_impact empty: {}", route.price_impact_pct.is_empty());
+
+                // Parse and validate
+                let impact: f32 = if route.price_impact_pct.is_empty() {
+                    println!("  WARNING: price_impact_pct is EMPTY");
+                    0.0
+                } else {
+                    match route.price_impact_pct.parse::<f32>() {
+                        Ok(v) => {
+                            println!("  Parsed impact: {}%", v);
+                            v
+                        }
+                        Err(e) => {
+                            println!("  ERROR parsing price_impact: {:?}", e);
+                            0.0
+                        }
+                    }
+                };
+
+                // For 10000 SOL we'd expect some price impact
+                if impact > 0.0 {
+                    println!("  Price impact detected: {}%", impact);
+                } else {
+                    println!("  WARNING: No price impact for 10000 SOL swap!");
+                }
+            }
+            Err(e) => {
+                println!("FAILED: {:?}", e);
+            }
+        }
+
+        // Also test small amount for comparison
+        let small_amount = 1_000_000_000u64; // 1 SOL
+        println!("\n--- Small swap: 1 SOL -> USDC ---");
+        match client
+            .get_quote(&sol_mint, &usdc_mint, small_amount, Some(50), false, Some(58), user_pubkey)
+            .await
+        {
+            Ok((route, _)) => {
+                println!("  price_impact_pct: '{}'", route.price_impact_pct);
+            }
+            Err(e) => {
+                println!("FAILED: {:?}", e);
+            }
+        }
+    }
+
+    /// Test reserve lookup for a specific obligation (Issue 2 investigation)
+    /// This reproduces the exact scenario from the failing liquidation
+    /// Run with: RPC_URL=<mainnet-url> cargo test test_reserve_lookup -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_reserve_lookup() {
+        use anchor_client::solana_client::{
+            nonblocking::rpc_client::RpcClient,
+            rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+            rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
+        };
+        use solana_sdk::commitment_config::CommitmentConfig;
+        use solana_account_decoder::UiAccountEncoding;
+
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .init();
+
+        // Get RPC URL from env (use public mainnet as fallback for testing)
+        let rpc_url = std::env::var("RPC_URL")
+            .or_else(|_| std::env::var("CLUSTER"))
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+        let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+        // The failing obligation from logs
+        let obligation_pubkey: Pubkey = "EaKZTZCTZ2m6bjGxC3rNQ2GMvG19ius5qTRkShPmLTCE".parse().unwrap();
+
+        // Expected reserves from the failing liquidation logs:
+        // Deposits: cbBTC (37Jk...), xBTC (4Hyr...)
+        // Borrows: USDG (ESCk...), USDC (D6q6...)
+
+        println!("\n=== Testing Reserve Lookup (Issue 2) ===");
+        println!("Obligation: {}", obligation_pubkey);
+
+        // 1. Fetch the obligation account
+        println!("\n--- Step 1: Fetching obligation ---");
+        let obligation_account = client
+            .get_account(&obligation_pubkey)
+            .await
+            .expect("Failed to fetch obligation account");
+
+        println!("Obligation account data length: {}", obligation_account.data.len());
+        println!("Obligation owner: {}", obligation_account.owner);
+
+        // The obligation has an 8-byte discriminator prefix
+        if obligation_account.data.len() < 8 + std::mem::size_of::<kamino_lending::Obligation>() {
+            panic!("Obligation data too short");
+        }
+
+        let obligation: kamino_lending::Obligation = *bytemuck::from_bytes(
+            &obligation_account.data[8..8 + std::mem::size_of::<kamino_lending::Obligation>()]
+        );
+
+        println!("Lending market: {}", obligation.lending_market);
+        println!("Deposits count: {}", obligation.deposits.iter().filter(|d| d.deposit_reserve != Pubkey::default()).count());
+        println!("Borrows count: {}", obligation.borrows.iter().filter(|b| b.borrow_reserve != Pubkey::default()).count());
+
+        // List all deposit reserves
+        println!("\nDeposit reserves:");
+        for (i, deposit) in obligation.deposits.iter().enumerate() {
+            if deposit.deposit_reserve != Pubkey::default() {
+                println!("  [{}] {}", i, deposit.deposit_reserve);
+            }
+        }
+
+        // List all borrow reserves
+        println!("\nBorrow reserves:");
+        for (i, borrow) in obligation.borrows.iter().enumerate() {
+            if borrow.borrow_reserve != Pubkey::default() {
+                println!("  [{}] {}", i, borrow.borrow_reserve);
+            }
+        }
+
+        // 2. Fetch all reserves for this lending market (same logic as accounts.rs)
+        println!("\n--- Step 2: Fetching reserves for lending market ---");
+        let klend_program_id: Pubkey = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".parse().unwrap();
+
+        // Filter by lending_market field at offset 32 (same as in accounts.rs)
+        let filter = RpcFilterType::Memcmp(Memcmp::new(
+            32,
+            MemcmpEncodedBytes::Bytes(obligation.lending_market.to_bytes().to_vec()),
+        ));
+
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![filter]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let accounts = client
+            .get_program_accounts_with_config(&klend_program_id, config)
+            .await
+            .expect("Failed to fetch program accounts");
+
+        println!("Found {} accounts for lending market", accounts.len());
+
+        // Parse reserves
+        let mut fetched_reserves: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+        for (pubkey, account) in &accounts {
+            // Reserves have a specific size (same check as in rpc.rs)
+            if account.data.len() == 8 + std::mem::size_of::<kamino_lending::Reserve>() {
+                fetched_reserves.insert(*pubkey);
+                println!("  Reserve: {}", pubkey);
+            }
+        }
+
+        println!("\nTotal reserves found: {}", fetched_reserves.len());
+
+        // 3. Check if all obligation reserves are in the fetched set
+        println!("\n--- Step 3: Checking reserve presence ---");
+
+        let mut all_present = true;
+        println!("\nChecking deposit reserves:");
+        for deposit in obligation.deposits.iter() {
+            if deposit.deposit_reserve != Pubkey::default() {
+                let present = fetched_reserves.contains(&deposit.deposit_reserve);
+                println!("  {} - {}", deposit.deposit_reserve, if present { "FOUND" } else { "MISSING!" });
+                if !present {
+                    all_present = false;
+                }
+            }
+        }
+
+        println!("\nChecking borrow reserves:");
+        for borrow in obligation.borrows.iter() {
+            if borrow.borrow_reserve != Pubkey::default() {
+                let present = fetched_reserves.contains(&borrow.borrow_reserve);
+                println!("  {} - {}", borrow.borrow_reserve, if present { "FOUND" } else { "MISSING!" });
+                if !present {
+                    all_present = false;
+                }
+            }
+        }
+
+        // 4. Verify first borrow/deposit (these are used for liquidation)
+        println!("\n--- Step 4: Checking liquidation reserves ---");
+
+        // OLD (buggy) approach: just use index 0
+        let debt_res_key_old = obligation.borrows[0].borrow_reserve;
+        let coll_res_key_old = obligation.deposits[0].deposit_reserve;
+        println!("OLD CODE (borrows[0]): {} - {}", debt_res_key_old, if debt_res_key_old == Pubkey::default() { "EMPTY SLOT!" } else if fetched_reserves.contains(&debt_res_key_old) { "FOUND" } else { "MISSING!" });
+        println!("OLD CODE (deposits[0]): {} - {}", coll_res_key_old, if coll_res_key_old == Pubkey::default() { "EMPTY SLOT!" } else if fetched_reserves.contains(&coll_res_key_old) { "FOUND" } else { "MISSING!" });
+
+        // NEW (fixed) approach: find first non-empty slot
+        let debt_res_key_new = obligation.borrows.iter()
+            .find(|b| b.borrow_reserve != Pubkey::default())
+            .map(|b| b.borrow_reserve);
+        let coll_res_key_new = obligation.deposits.iter()
+            .find(|d| d.deposit_reserve != Pubkey::default())
+            .map(|d| d.deposit_reserve);
+        println!("NEW CODE (first non-empty borrow): {:?} - {}", debt_res_key_new, debt_res_key_new.map(|k| if fetched_reserves.contains(&k) { "FOUND" } else { "MISSING" }).unwrap_or("None"));
+        println!("NEW CODE (first non-empty deposit): {:?} - {}", coll_res_key_new, coll_res_key_new.map(|k| if fetched_reserves.contains(&k) { "FOUND" } else { "MISSING" }).unwrap_or("None"));
+
+        // Summary
+        println!("\n=== Test Result ===");
+        if all_present {
+            println!("SUCCESS: All obligation reserves found in market reserves");
+        } else {
+            println!("FAILURE: Some reserves are missing!");
+            println!("This explains the 'reserve not found' error");
+        }
+    }
 }

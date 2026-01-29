@@ -762,30 +762,75 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         );
 
         // Build transaction
+        let luts_count = luts.len();
         let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
         for lut in luts {
             txn = txn.add_lookup_table(lut);
         }
 
+        // Check transaction size before proceeding
         let txn_b64 = txn.to_base64();
+        let txn_size = txn_b64.len();
+        const MAX_TX_SIZE: usize = 1644; // Max base64 encoded size
+
+        if txn_size > MAX_TX_SIZE {
+            warn!(
+                "Transaction too large: {} bytes (max {}). Skipping liquidation.",
+                txn_size, MAX_TX_SIZE
+            );
+            info!(
+                "Debug: {} instructions, {} swap lookup tables. \
+                 TODO: Enable liquidator lookup table via LIQUIDATOR_LOOKUP_TABLE_FILE env var \
+                 and call klend_client.load_lookup_table() to reduce transaction size.",
+                ixns.len(),
+                luts_count
+            );
+            return Ok(());
+        }
+
+        info!(
+            "Transaction size: {} bytes ({:.1}% of max)",
+            txn_size,
+            (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
+        );
         println!(
             "Simulation: https://explorer.solana.com/tx/inspector?message={}",
             urlencoding::encode(&txn_b64)
         );
 
-        let txn = txn.build_with_budget_and_fee(&[]).await.unwrap();
+        let txn = match txn.build_with_budget_and_fee(&[]).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to build transaction: {:?}", e);
+                return Ok(());
+            }
+        };
 
-        let res = klend_client
+        let res = match klend_client
             .client
             .client
             .simulate_transaction(&txn)
             .await
-            .unwrap();
-        info!("Simulation result: {:?}", res);
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Transaction simulation failed: {:?}", e);
+                return Ok(());
+            }
+        };
 
-        for ix in ixns {
-            println!("Instruction: {:?} {:?}", ix.program_id, ix.data);
+        // Check simulation result for errors
+        if let Some(err) = res.value.err {
+            warn!("Simulation returned error: {:?}", err);
+            if let Some(logs) = &res.value.logs {
+                for log in logs.iter().rev().take(5) {
+                    warn!("  Log: {}", log);
+                }
+            }
+            return Ok(());
         }
+
+        info!("Simulation succeeded, units consumed: {:?}", res.value.units_consumed);
 
         let should_send = true;
 

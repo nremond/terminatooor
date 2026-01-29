@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     str::FromStr,
     sync::{Arc, RwLock},
@@ -22,7 +22,6 @@ use kamino_lending::{
     utils::seeds, LendingMarket, Obligation, ReferrerTokenState, Reserve, ReserveFarmKind,
 };
 use orbit_link::OrbitLink;
-use solana_account_decoder::parse_address_lookup_table::UiLookupTable;
 use solana_sdk::{
     address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount},
     commitment_config::CommitmentConfig,
@@ -49,8 +48,9 @@ pub struct KlendClient {
 
     pub client: OrbitLink<RpcClient, Keypair>,
 
-    // Txn data - wrapped in RwLock for interior mutability (allows loading after Arc wrapping)
-    pub lookup_table: RwLock<Option<AddressLookupTableAccount>>,
+    // Per-market lookup tables for transaction size reduction
+    // Key: market pubkey, Value: lookup table account
+    pub lookup_tables: RwLock<HashMap<Pubkey, AddressLookupTableAccount>>,
 
     // Rebalance settings
     pub rebalance_config: Option<RebalanceConfig>,
@@ -90,7 +90,7 @@ impl KlendClient {
         Ok(Self {
             program_id,
             client,
-            lookup_table: RwLock::new(None),
+            lookup_tables: RwLock::new(HashMap::new()),
             liquidator,
             rebalance_config,
         })
@@ -176,129 +176,183 @@ impl KlendClient {
 
     /// Load or create the liquidator's lookup table for the given market.
     /// This reduces transaction size by using address lookup tables.
-    /// Uses LIQUIDATOR_LOOKUP_TABLE_FILE env var or defaults to "liquidator_lookup_table.txt".
-    pub async fn load_lookup_table(&self, market_accounts: &MarketAccounts) -> Result<()> {
-        self.load_liquidator_lookup_table().await?;
-        self.update_liquidator_lookup_table(collect_keys(
+    /// Each market has its own lookup table to stay under the 256 address limit.
+    /// Uses LIQUIDATOR_LOOKUP_TABLE_FILE env var or defaults to "liquidator_lookup_tables.json".
+    pub async fn load_lookup_table(&self, market_key: &Pubkey, market_accounts: &MarketAccounts) -> Result<()> {
+
+        // Load existing LUT mappings from file
+        self.load_lookup_tables_from_file().await?;
+
+        // Get or create LUT for this market
+        let expected_keys = collect_keys(
             &market_accounts.reserves,
             &self.liquidator,
             &market_accounts.lending_market,
-        ))
-        .await?;
+        );
 
-        // Add to OrbitLink for use in all transactions
-        let lut = self.lookup_table.read().unwrap().clone();
-        if let Some(lut) = lut {
-            // Note: This requires OrbitLink to support adding lookup tables
-            // For now we'll return the table and let callers add it manually
-            info!("Lookup table loaded with {} addresses", lut.addresses.len());
+        self.ensure_market_lookup_table(market_key, expected_keys).await?;
+
+        let luts = self.lookup_tables.read().unwrap();
+        if let Some(lut) = luts.get(market_key) {
+            info!("Lookup table for market {} loaded with {} addresses", market_key, lut.addresses.len());
         }
         Ok(())
     }
 
-    /// Get the current lookup table if loaded
-    pub fn get_lookup_table(&self) -> Option<AddressLookupTableAccount> {
-        self.lookup_table.read().unwrap().clone()
+    /// Get the lookup table for a specific market
+    pub fn get_lookup_table(&self, market: &Pubkey) -> Option<AddressLookupTableAccount> {
+        self.lookup_tables.read().unwrap().get(market).cloned()
     }
 
-    async fn load_liquidator_lookup_table(&self) -> Result<()> {
-        // The liquidator has one static lookup table associated with it
-        // and is stored on a local file
-        // Here we load it or create it and save it
-        // we do not manage the addresses, that is done in a separate stage
+    fn get_lookup_tables_filename() -> String {
+        std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE")
+            .unwrap_or_else(|_| "liquidator_lookup_tables.json".to_string())
+    }
 
-        let filename = std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE")
-            .unwrap_or_else(|_| "liquidator_lookup_table.txt".to_string());
+    /// Load all lookup table mappings from the JSON file
+    async fn load_lookup_tables_from_file(&self) -> Result<()> {
+        let filename = Self::get_lookup_tables_filename();
 
         if !std::path::Path::new(&filename).exists() {
-            File::create(&filename)?;
+            // Create empty JSON file
+            let mut file = File::create(&filename)?;
+            file.write_all(b"{}")?;
+            return Ok(());
         }
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&filename)?;
-        let mut current_content = String::new();
-        file.read_to_string(&mut current_content)?;
+        let mut file = File::open(&filename)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
 
-        if current_content.is_empty() {
-            let lut = self
-                .create_init_reserve_lookup_table(&[], || {
-                    thread::sleep(Duration::from_secs(12));
-                })
-                .await?;
-            *self.lookup_table.write().unwrap() = Some(lut.clone());
-            file.set_len(0)?;
-            file.write_all(lut.key.to_string().as_bytes())?;
-            info!("Created new empty lookup table {}", lut.key);
-        } else {
-            let lut_key = Pubkey::from_str(&current_content)
-                .map_err(|e| anyhow!("Invalid lookup table pubkey in file: {}", e))?;
-            info!("Liquidator lookup table: {:?}", lut_key);
-            let lookup_table_data = self.client.client.get_account(&lut_key).await
-                .map_err(|e| anyhow!("Failed to fetch lookup table account: {}", e))?;
-            let lookup_table: UiLookupTable = UiLookupTable::from(
-                AddressLookupTable::deserialize(&lookup_table_data.data)
-                    .map_err(|e| anyhow!("Failed to deserialize lookup table: {}", e))?,
-            );
-            *self.lookup_table.write().unwrap() = Some(AddressLookupTableAccount {
-                key: lut_key,
-                addresses: lookup_table
-                    .addresses
-                    .iter()
-                    .filter_map(|x| Pubkey::from_str(x).ok())
-                    .collect::<Vec<Pubkey>>(),
-            });
-            info!(
-                "Loaded lookup table {} with {} keys",
-                lut_key,
-                lookup_table.addresses.len()
-            );
+        if content.trim().is_empty() || content.trim() == "{}" {
+            return Ok(());
         }
-        Ok(())
-    }
 
-    async fn update_liquidator_lookup_table(&self, expected: HashSet<Pubkey>) -> Result<()> {
-        {
-            let lut = self.lookup_table.read().unwrap();
-            if lut.is_none() {
-                drop(lut);
-                self.load_liquidator_lookup_table().await?;
+        // Parse JSON: {"market_pubkey": "lut_pubkey", ...}
+        let mapping: HashMap<String, String> = serde_json::from_str(&content)
+            .map_err(|e| anyhow!("Failed to parse lookup tables JSON: {}", e))?;
+
+        for (market_str, lut_str) in mapping {
+            let market_key = Pubkey::from_str(&market_str)
+                .map_err(|e| anyhow!("Invalid market pubkey {}: {}", market_str, e))?;
+            let lut_key = Pubkey::from_str(&lut_str)
+                .map_err(|e| anyhow!("Invalid LUT pubkey {}: {}", lut_str, e))?;
+
+            // Fetch the actual lookup table data from chain
+            match self.client.client.get_account(&lut_key).await {
+                Ok(account) => {
+                    match AddressLookupTable::deserialize(&account.data) {
+                        Ok(table) => {
+                            let lut_account = AddressLookupTableAccount {
+                                key: lut_key,
+                                addresses: table.addresses.to_vec(),
+                            };
+                            info!("Loaded lookup table {} for market {} with {} addresses",
+                                  lut_key, market_key, lut_account.addresses.len());
+                            self.lookup_tables.write().unwrap().insert(market_key, lut_account);
+                        }
+                        Err(e) => {
+                            info!("Failed to deserialize lookup table {}: {:?}", lut_key, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("Failed to fetch lookup table {}: {:?}", lut_key, e);
+                }
             }
         }
 
-        let (lut_key, missing_keys) = {
-            let lut_guard = self.lookup_table.read().unwrap();
-            let lut = lut_guard.as_ref().ok_or_else(|| anyhow!("Lookup table not loaded"))?;
+        Ok(())
+    }
+
+    /// Save the current lookup table mappings to file
+    fn save_lookup_tables_to_file(&self) -> Result<()> {
+        let filename = Self::get_lookup_tables_filename();
+
+        let mapping: HashMap<String, String> = self.lookup_tables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(market, lut)| (market.to_string(), lut.key.to_string()))
+            .collect();
+
+        let json = serde_json::to_string_pretty(&mapping)
+            .map_err(|e| anyhow!("Failed to serialize lookup tables: {}", e))?;
+
+        let mut file = File::create(&filename)?;
+        file.write_all(json.as_bytes())?;
+
+        Ok(())
+    }
+
+    /// Ensure a lookup table exists for the given market with the expected keys
+    async fn ensure_market_lookup_table(&self, market: &Pubkey, expected: HashSet<Pubkey>) -> Result<()> {
+        const MAX_LUT_ADDRESSES: usize = 256;
+
+        let has_lut = self.lookup_tables.read().unwrap().contains_key(market);
+
+        if !has_lut {
+            // Create new lookup table for this market
+            info!("Creating new lookup table for market {}", market);
+            let keys_to_add: Vec<Pubkey> = expected.iter().copied().take(MAX_LUT_ADDRESSES).collect();
+
+            let lut = self.create_init_reserve_lookup_table(&keys_to_add, || {
+                thread::sleep(Duration::from_secs(12));
+            }).await?;
+
+            info!("Created lookup table {} for market {} with {} addresses", lut.key, market, lut.addresses.len());
+            self.lookup_tables.write().unwrap().insert(*market, lut);
+            self.save_lookup_tables_to_file()?;
+            return Ok(());
+        }
+
+        // Check if we need to extend the existing LUT
+        let (lut_key, current_count, missing_keys) = {
+            let luts = self.lookup_tables.read().unwrap();
+            let lut = luts.get(market).ok_or_else(|| anyhow!("Lookup table not found"))?;
             let already_in_lut: HashSet<Pubkey> = HashSet::from_iter(lut.addresses.iter().copied());
 
-            let missing_keys: Vec<Pubkey> = expected
+            let missing: Vec<Pubkey> = expected
                 .iter()
                 .filter(|x| !already_in_lut.contains(x))
                 .copied()
                 .collect();
 
-            let extra_keys: Vec<Pubkey> = lut
-                .addresses
-                .iter()
-                .filter(|x| !expected.contains(*x))
-                .copied()
-                .collect();
+            info!("Market {} lookup table: {} current, {} missing keys",
+                  market, lut.addresses.len(), missing.len());
 
-            info!("Lookup table: {} missing keys, {} extra keys", missing_keys.len(), extra_keys.len());
-            (lut.key, missing_keys)
+            (lut.key, lut.addresses.len(), missing)
         };
 
         if !missing_keys.is_empty() {
-            info!("Extending lookup table with {} new keys", missing_keys.len());
-            self.extend_lut_with_keys(lut_key, &missing_keys, || {
-                thread::sleep(Duration::from_secs(12));
-            })
-            .await?;
+            // Only add keys up to the 256 limit
+            let space_available = MAX_LUT_ADDRESSES.saturating_sub(current_count);
+            if space_available == 0 {
+                info!("Lookup table for market {} is full (256 addresses)", market);
+                return Ok(());
+            }
 
-            // Reload it
-            self.load_liquidator_lookup_table().await?;
+            let keys_to_add: Vec<Pubkey> = missing_keys.into_iter().take(space_available).collect();
+            info!("Extending lookup table for market {} with {} new keys", market, keys_to_add.len());
+
+            self.extend_lut_with_keys(lut_key, &keys_to_add, || {
+                thread::sleep(Duration::from_secs(12));
+            }).await?;
+
+            // Reload the lookup table
+            let account = self.client.client.get_account(&lut_key).await
+                .map_err(|e| anyhow!("Failed to fetch lookup table: {}", e))?;
+            let table = AddressLookupTable::deserialize(&account.data)
+                .map_err(|e| anyhow!("Failed to deserialize lookup table: {}", e))?;
+
+            let lut_account = AddressLookupTableAccount {
+                key: lut_key,
+                addresses: table.addresses.to_vec(),
+            };
+
+            self.lookup_tables.write().unwrap().insert(*market, lut_account);
         }
+
         Ok(())
     }
 

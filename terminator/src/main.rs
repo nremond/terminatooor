@@ -500,7 +500,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     info!("Fetched {} reserves for market {}", reserves.len(), ob.lending_market);
 
     // Load/update the liquidator lookup table for this market (reduces transaction size)
-    if let Err(e) = klend_client.load_lookup_table(&market_accs).await {
+    if let Err(e) = klend_client.load_lookup_table(&ob.lending_market, &market_accs).await {
         warn!("Failed to load lookup table: {:?}", e);
     }
 
@@ -772,7 +772,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
         // Add liquidator lookup table (for Kamino accounts)
         let mut total_luts = 0;
-        if let Some(liquidator_lut) = klend_client.get_lookup_table() {
+        if let Some(liquidator_lut) = klend_client.get_lookup_table(&lending_market.key) {
             info!("Adding liquidator lookup table with {} addresses", liquidator_lut.addresses.len());
             txn = txn.add_lookup_table(liquidator_lut);
             total_luts += 1;
@@ -798,7 +798,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 "Debug: {} instructions, {} lookup tables ({} liquidator, {} swap)",
                 ixns.len(),
                 total_luts,
-                if klend_client.get_lookup_table().is_some() { 1 } else { 0 },
+                if klend_client.get_lookup_table(&lending_market.key).is_some() { 1 } else { 0 },
                 swap_luts_count
             );
             return Ok(());
@@ -1203,7 +1203,7 @@ async fn load_market_state(klend_client: &KlendClient, market: &Pubkey) -> Resul
     let rts = klend_client.fetch_referrer_token_states().await?;
 
     // Load/update the liquidator lookup table for this market (reduces transaction size)
-    if let Err(e) = klend_client.load_lookup_table(&market_accs).await {
+    if let Err(e) = klend_client.load_lookup_table(market, &market_accs).await {
         warn!("Failed to load lookup table for market {}: {:?}", market, e);
     }
 

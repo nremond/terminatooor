@@ -22,7 +22,7 @@ use crate::{
     client::{KlendClient, RebalanceConfig},
     config::get_lending_markets,
     geyser::{GeyserConfig, GeyserStream},
-    routing::get_best_swap_instructions,
+    routing::{get_best_swap_instructions, SwapResult},
     liquidator::{Holding, Holdings},
     math::{LiquidationStrategy, Fraction},
     model::StateWithKey,
@@ -451,10 +451,17 @@ pub mod swap {
         )
         .await?;
 
+        info!(
+            "Swap quote: in={} out={} (slippage={}bps)",
+            swap_result.route.in_amount,
+            swap_result.route.out_amount,
+            swap_result.route.slippage_bps
+        );
+
         let DecompiledVersionedTx {
             lookup_tables,
             instructions: jup_ixs,
-        } = swap_result;
+        } = swap_result.tx;
 
         let mut builder = klend_client.client.tx_builder().add_ixs(jup_ixs);
 
@@ -653,6 +660,12 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             .await?;
         ixns.extend_from_slice(&liquidate_ixns);
 
+        // Calculate flash loan repay amount (needed for profitability check)
+        let repay_amount = instructions::calculate_flash_loan_repay_amount(
+            &debt_reserve.state.borrow(),
+            liquidate_amount,
+        );
+
         // 3. Swap collateral back to debt token (if they're different)
         if coll_mint != debt_mint && expected_collateral > 0 {
             info!(
@@ -683,10 +696,33 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 }
             };
 
+            // PROFITABILITY CHECK: Verify swap output covers flash loan repayment
+            let swap_out_amount = swap_result.route.out_amount;
+            info!(
+                "Swap quote: in={} out={} (need {} to repay flash loan)",
+                swap_result.route.in_amount, swap_out_amount, repay_amount
+            );
+
+            if swap_out_amount < repay_amount {
+                let loss = repay_amount - swap_out_amount;
+                warn!(
+                    "UNPROFITABLE: Swap output {} < repay amount {}. Would lose {} debt tokens. Skipping.",
+                    swap_out_amount, repay_amount, loss
+                );
+                return Ok(());
+            }
+
+            let profit = swap_out_amount - repay_amount;
+            info!(
+                "PROFITABLE: Expected profit = {} debt tokens (swap_out={} - repay={})",
+                profit, swap_out_amount, repay_amount
+            );
+
+            let SwapResult { route: _, tx: swap_tx } = swap_result;
             let DecompiledVersionedTx {
                 lookup_tables,
                 instructions: swap_ixs,
-            } = swap_result;
+            } = swap_tx;
 
             // Filter compute budget ixns
             let swap_ixs = swap_ixs
@@ -704,10 +740,6 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         }
 
         // 4. Flash repay (borrowed amount + fee)
-        let repay_amount = instructions::calculate_flash_loan_repay_amount(
-            &debt_reserve.state.borrow(),
-            liquidate_amount,
-        );
         let flash_repay_ix = instructions::flash_repay_reserve_liquidity_ix(
             &klend_client.program_id,
             &lending_market.key,

@@ -9,6 +9,13 @@ use crate::consts::{
 };
 use crate::titan::{self, DecompiledVersionedTx, Error as TitanError, SwapRoute, TitanResult};
 
+/// Swap result containing both quote info and instructions
+#[derive(Debug)]
+pub struct SwapResult {
+    pub route: SwapRoute,
+    pub tx: DecompiledVersionedTx,
+}
+
 pub async fn get_best_swap_route(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -49,6 +56,7 @@ pub async fn get_best_swap_route(
 
 #[allow(clippy::too_many_arguments)]
 /// Get the swap instructions for the best route matching parameters
+/// Returns both the route (with quote info) and the transaction instructions
 pub async fn get_best_swap_instructions(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -60,7 +68,7 @@ pub async fn get_best_swap_instructions(
     _rpc_client: &RpcClient,
     accounts: Option<&Vec<&Pubkey>>,
     accounts_count_buffer: Option<usize>,
-) -> TitanResult<DecompiledVersionedTx> {
+) -> TitanResult<SwapResult> {
     // when we use swap + Kamino's swap rewards in a single transaction, the total number of unique accounts that we can lock (include) in the tx is 64. We need to count how many accounts the Kamino ix will use and require the API to give us a route that uses less than MAX_ACCOUNTS_PER_TRANSACTION - the amount of accounts that Kamino will use.
     let accounts_count_buffer = accounts_count_buffer.unwrap_or(0);
     let mut extra_accounts_buffer = EXTRA_ACCOUNTS_BUFFER;
@@ -107,7 +115,7 @@ pub async fn get_best_swap_instructions(
             }
         };
 
-        if best_route.is_some() {
+        if let Some(route) = best_route {
             info!("Getting swap instructions...");
             // Get the actual swap instructions
             let instructions_result = titan::get_swap_instructions(
@@ -128,8 +136,8 @@ pub async fn get_best_swap_instructions(
                     .chain(accounts_distinct.iter().copied())
                     .collect::<HashSet<_>>();
                 if total_accounts.len() <= MAX_ACCOUNTS_PER_TRANSACTION {
-                    println!("max accounts {}", max_accounts);
-                    return Ok(decompiled_tx);
+                    info!("max accounts {}", max_accounts);
+                    return Ok(SwapResult { route, tx: decompiled_tx });
                 }
             }
         } else {

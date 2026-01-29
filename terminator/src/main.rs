@@ -795,8 +795,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 txn_size, MAX_TX_SIZE
             );
             info!(
-                "Debug: {} instructions, {} lookup tables ({} liquidator, {} swap). \
-                 Set LIQUIDATOR_LOOKUP_TABLE_FILE env var to enable lookup table compression.",
+                "Debug: {} instructions, {} lookup tables ({} liquidator, {} swap)",
                 ixns.len(),
                 total_luts,
                 if klend_client.get_lookup_table().is_some() { 1 } else { 0 },

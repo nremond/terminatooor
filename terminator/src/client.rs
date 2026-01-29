@@ -176,14 +176,8 @@ impl KlendClient {
 
     /// Load or create the liquidator's lookup table for the given market.
     /// This reduces transaction size by using address lookup tables.
-    /// Requires LIQUIDATOR_LOOKUP_TABLE_FILE env var to be set.
+    /// Uses LIQUIDATOR_LOOKUP_TABLE_FILE env var or defaults to "liquidator_lookup_table.txt".
     pub async fn load_lookup_table(&self, market_accounts: &MarketAccounts) -> Result<()> {
-        // Check if env var is set
-        if std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE").is_err() {
-            info!("LIQUIDATOR_LOOKUP_TABLE_FILE not set, skipping lookup table loading");
-            return Ok(());
-        }
-
         self.load_liquidator_lookup_table().await?;
         self.update_liquidator_lookup_table(collect_keys(
             &market_accounts.reserves,

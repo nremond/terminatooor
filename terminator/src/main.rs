@@ -627,13 +627,12 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
             )
-            .await
-            .unwrap();
+            .await?;
         ixns.extend_from_slice(&liquidate_ixns);
 
         // 3. Swap collateral back to debt token (if they're different)
         if coll_mint != debt_mint && expected_collateral > 0 {
-            let swap_result = get_best_swap_instructions(
+            let swap_result = match get_best_swap_instructions(
                 &coll_mint,
                 &debt_mint,
                 expected_collateral,
@@ -646,7 +645,16 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 None,
             )
             .await
-            .unwrap();
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(
+                        "No swap route found from {} to {}: {:?}, skipping liquidation",
+                        coll_mint, debt_mint, e
+                    );
+                    return Ok(());
+                }
+            };
 
             let DecompiledVersionedTx {
                 lookup_tables,

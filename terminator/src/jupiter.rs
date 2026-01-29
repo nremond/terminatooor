@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anchor_lang::prelude::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::consts::{
     EXTRA_ACCOUNTS_BUFFER, MAX_ACCOUNTS_PER_TRANSACTION, MAX_EXTRA_ACCOUNTS_BUFFER,
@@ -17,6 +17,7 @@ pub async fn get_best_swap_route(
     slippage_bps: Option<u16>,
     price_impact_limit: Option<f32>,
     max_accounts: Option<u8>,
+    user_public_key: Pubkey,
 ) -> TitanResult<SwapRoute> {
     let best_route = titan::get_quote(
         input_mint,
@@ -25,6 +26,7 @@ pub async fn get_best_swap_route(
         only_direct_routes,
         slippage_bps,
         max_accounts,
+        user_public_key,
     )
     .await?;
 
@@ -72,6 +74,11 @@ pub async fn get_best_swap_instructions(
             .saturating_sub(extra_accounts_buffer)
             .saturating_sub(accounts_count_buffer);
 
+        info!(
+            "Trying swap route with max_accounts={} (buffer={})",
+            max_accounts, extra_accounts_buffer
+        );
+
         // First check if we can get a valid quote with these constraints
         let best_route = match get_best_swap_route(
             input_mint,
@@ -81,14 +88,22 @@ pub async fn get_best_swap_instructions(
             slippage_bps,
             price_impact_limit,
             Some(max_accounts.try_into().unwrap()),
+            user_public_key,
         )
         .await
         {
-            Ok(res) => Some(res),
-            Err(_) => None,
+            Ok(res) => {
+                info!("Got route: in={} out={}", res.in_amount, res.out_amount);
+                Some(res)
+            }
+            Err(e) => {
+                info!("No route found: {:?}", e);
+                None
+            }
         };
 
         if best_route.is_some() {
+            info!("Getting swap instructions...");
             // Get the actual swap instructions
             let instructions_result = titan::get_swap_instructions(
                 input_mint,
@@ -100,6 +115,7 @@ pub async fn get_best_swap_instructions(
             .await;
 
             if let Ok(decompiled_tx) = instructions_result {
+                info!("Got {} swap instructions", decompiled_tx.instructions.len());
                 let total_accounts = decompiled_tx
                     .instructions
                     .iter()

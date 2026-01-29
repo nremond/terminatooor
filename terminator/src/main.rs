@@ -632,6 +632,10 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
         // 3. Swap collateral back to debt token (if they're different)
         if coll_mint != debt_mint && expected_collateral > 0 {
+            info!(
+                "Getting swap instructions: {} -> {} amount={}",
+                coll_mint, debt_mint, expected_collateral
+            );
             let swap_result = match get_best_swap_instructions(
                 &coll_mint,
                 &debt_mint,

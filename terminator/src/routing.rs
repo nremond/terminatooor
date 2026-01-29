@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anchor_lang::prelude::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount};
 use tracing::{info, warn};
 
 use crate::consts::{
@@ -65,7 +66,7 @@ pub async fn get_best_swap_instructions(
     slippage_bps: Option<u16>,
     price_impact_limit: Option<f32>,
     user_public_key: Pubkey,
-    _rpc_client: &RpcClient,
+    rpc_client: &RpcClient,
     accounts: Option<&Vec<&Pubkey>>,
     accounts_count_buffer: Option<usize>,
 ) -> TitanResult<SwapResult> {
@@ -127,7 +128,7 @@ pub async fn get_best_swap_instructions(
             )
             .await;
 
-            if let Ok(decompiled_tx) = instructions_result {
+            if let Ok(mut decompiled_tx) = instructions_result {
                 info!("Got {} swap instructions", decompiled_tx.instructions.len());
                 let total_accounts = decompiled_tx
                     .instructions
@@ -137,6 +138,15 @@ pub async fn get_best_swap_instructions(
                     .collect::<HashSet<_>>();
                 if total_accounts.len() <= MAX_ACCOUNTS_PER_TRANSACTION {
                     info!("max accounts {}", max_accounts);
+
+                    // Fetch lookup tables from Titan's response
+                    if !route.address_lookup_tables.is_empty() {
+                        let swap_luts = fetch_lookup_tables(rpc_client, &route.address_lookup_tables).await;
+                        if !swap_luts.is_empty() {
+                            decompiled_tx.lookup_tables = Some(swap_luts);
+                        }
+                    }
+
                     return Ok(SwapResult { route, tx: decompiled_tx });
                 }
             }
@@ -149,4 +159,34 @@ pub async fn get_best_swap_instructions(
     }
 
     Err(TitanError::NoValidRoute)
+}
+
+/// Fetch lookup table accounts from RPC given their addresses
+async fn fetch_lookup_tables(
+    rpc_client: &RpcClient,
+    addresses: &[Pubkey],
+) -> Vec<AddressLookupTableAccount> {
+    let mut tables = Vec::new();
+    for address in addresses {
+        match rpc_client.get_account(address).await {
+            Ok(account) => {
+                match AddressLookupTable::deserialize(&account.data) {
+                    Ok(table) => {
+                        tables.push(AddressLookupTableAccount {
+                            key: *address,
+                            addresses: table.addresses.to_vec(),
+                        });
+                        info!("Loaded swap lookup table {} with {} addresses", address, table.addresses.len());
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize lookup table {}: {:?}", address, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch lookup table {}: {:?}", address, e);
+            }
+        }
+    }
+    tables
 }

@@ -49,8 +49,8 @@ pub struct KlendClient {
 
     pub client: OrbitLink<RpcClient, Keypair>,
 
-    // Txn data
-    pub lookup_table: Option<AddressLookupTableAccount>,
+    // Txn data - wrapped in RwLock for interior mutability (allows loading after Arc wrapping)
+    pub lookup_table: RwLock<Option<AddressLookupTableAccount>>,
 
     // Rebalance settings
     pub rebalance_config: Option<RebalanceConfig>,
@@ -90,7 +90,7 @@ impl KlendClient {
         Ok(Self {
             program_id,
             client,
-            lookup_table: None,
+            lookup_table: RwLock::new(None),
             liquidator,
             rebalance_config,
         })
@@ -174,62 +174,85 @@ impl KlendClient {
         Ok(map)
     }
 
-    pub async fn load_lookup_table(&mut self, market_accounts: MarketAccounts) {
-        self.load_liquidator_lookup_table().await;
+    /// Load or create the liquidator's lookup table for the given market.
+    /// This reduces transaction size by using address lookup tables.
+    /// Requires LIQUIDATOR_LOOKUP_TABLE_FILE env var to be set.
+    pub async fn load_lookup_table(&self, market_accounts: &MarketAccounts) -> Result<()> {
+        // Check if env var is set
+        if std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE").is_err() {
+            info!("LIQUIDATOR_LOOKUP_TABLE_FILE not set, skipping lookup table loading");
+            return Ok(());
+        }
+
+        self.load_liquidator_lookup_table().await?;
         self.update_liquidator_lookup_table(collect_keys(
             &market_accounts.reserves,
             &self.liquidator,
             &market_accounts.lending_market,
         ))
-        .await;
-        self.client
-            .add_lookup_table(self.lookup_table.clone().unwrap());
+        .await?;
+
+        // Add to OrbitLink for use in all transactions
+        let lut = self.lookup_table.read().unwrap().clone();
+        if let Some(lut) = lut {
+            // Note: This requires OrbitLink to support adding lookup tables
+            // For now we'll return the table and let callers add it manually
+            info!("Lookup table loaded with {} addresses", lut.addresses.len());
+        }
+        Ok(())
     }
 
-    async fn load_liquidator_lookup_table(&mut self) {
+    /// Get the current lookup table if loaded
+    pub fn get_lookup_table(&self) -> Option<AddressLookupTableAccount> {
+        self.lookup_table.read().unwrap().clone()
+    }
+
+    async fn load_liquidator_lookup_table(&self) -> Result<()> {
         // The liquidator has one static lookup table associated with it
         // and is stored on a local file
         // Here we load it or create it and save it
         // we do not manage the addresses, that is done in a separate stage
 
-        let filename = std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE").unwrap();
+        let filename = std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE")
+            .map_err(|_| anyhow!("LIQUIDATOR_LOOKUP_TABLE_FILE env var not set"))?;
 
         if !std::path::Path::new(&filename).exists() {
-            File::create(&filename).unwrap();
+            File::create(&filename)?;
         }
 
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&filename)
-            .unwrap();
+            .open(&filename)?;
         let mut current_content = String::new();
-        file.read_to_string(&mut current_content).unwrap();
+        file.read_to_string(&mut current_content)?;
 
         if current_content.is_empty() {
             let lut = self
                 .create_init_reserve_lookup_table(&[], || {
                     thread::sleep(Duration::from_secs(12));
                 })
-                .await
-                .unwrap();
-            self.lookup_table = Some(lut.clone());
-            file.set_len(0).unwrap();
-            file.write_all(lut.key.to_string().as_bytes()).unwrap();
+                .await?;
+            *self.lookup_table.write().unwrap() = Some(lut.clone());
+            file.set_len(0)?;
+            file.write_all(lut.key.to_string().as_bytes())?;
             info!("Created new empty lookup table {}", lut.key);
         } else {
-            let lut_key = Pubkey::from_str(&current_content).unwrap();
-            info!("Liquidator lookuptable {:?}", lut_key);
-            let lookup_table_data = self.client.client.get_account(&lut_key).await.unwrap();
+            let lut_key = Pubkey::from_str(&current_content)
+                .map_err(|e| anyhow!("Invalid lookup table pubkey in file: {}", e))?;
+            info!("Liquidator lookup table: {:?}", lut_key);
+            let lookup_table_data = self.client.client.get_account(&lut_key).await
+                .map_err(|e| anyhow!("Failed to fetch lookup table account: {}", e))?;
             let lookup_table: UiLookupTable = UiLookupTable::from(
-                AddressLookupTable::deserialize(&lookup_table_data.data).unwrap(),
+                AddressLookupTable::deserialize(&lookup_table_data.data)
+                    .map_err(|e| anyhow!("Failed to deserialize lookup table: {}", e))?,
             );
-            self.lookup_table = Some(AddressLookupTableAccount {
+            *self.lookup_table.write().unwrap() = Some(AddressLookupTableAccount {
                 key: lut_key,
                 addresses: lookup_table
                     .addresses
                     .iter()
-                    .map(|x| Pubkey::from_str(x).unwrap())
+                    .filter_map(|x| Pubkey::from_str(x).ok())
                     .collect::<Vec<Pubkey>>(),
             });
             info!(
@@ -238,49 +261,55 @@ impl KlendClient {
                 lookup_table.addresses.len()
             );
         }
+        Ok(())
     }
 
-    async fn update_liquidator_lookup_table(&mut self, expected: HashSet<Pubkey>) {
-        if self.lookup_table.is_none() {
-            self.load_liquidator_lookup_table().await;
+    async fn update_liquidator_lookup_table(&self, expected: HashSet<Pubkey>) -> Result<()> {
+        {
+            let lut = self.lookup_table.read().unwrap();
+            if lut.is_none() {
+                drop(lut);
+                self.load_liquidator_lookup_table().await?;
+            }
         }
 
-        // TODO: Maybe sleep
-        let lut = self.lookup_table.as_ref().unwrap();
-        let already_in_lut: HashSet<Pubkey> = HashSet::from_iter(lut.addresses.iter().copied());
-        let expected_in_lut: HashSet<Pubkey> = expected;
+        let (lut_key, missing_keys) = {
+            let lut_guard = self.lookup_table.read().unwrap();
+            let lut = lut_guard.as_ref().ok_or_else(|| anyhow!("Lookup table not loaded"))?;
+            let already_in_lut: HashSet<Pubkey> = HashSet::from_iter(lut.addresses.iter().copied());
 
-        let missing_keys = expected_in_lut
-            .iter()
-            .filter(|x| !already_in_lut.contains(x))
-            .copied()
-            .collect::<Vec<Pubkey>>();
+            let missing_keys: Vec<Pubkey> = expected
+                .iter()
+                .filter(|x| !already_in_lut.contains(x))
+                .copied()
+                .collect();
 
-        let extra_keys = lut
-            .addresses
-            .iter()
-            .filter(|x| !expected_in_lut.contains(*x))
-            .copied()
-            .collect::<Vec<Pubkey>>();
+            let extra_keys: Vec<Pubkey> = lut
+                .addresses
+                .iter()
+                .filter(|x| !expected.contains(*x))
+                .copied()
+                .collect();
 
-        info!("Missing keys: {:?}", missing_keys.len());
-        info!("Extra keys: {:?}", extra_keys.len());
+            info!("Lookup table: {} missing keys, {} extra keys", missing_keys.len(), extra_keys.len());
+            (lut.key, missing_keys)
+        };
 
         if !missing_keys.is_empty() {
-            info!("Extending lookup table");
-            self.extend_lut_with_keys(lut.key, &missing_keys, || {
+            info!("Extending lookup table with {} new keys", missing_keys.len());
+            self.extend_lut_with_keys(lut_key, &missing_keys, || {
                 thread::sleep(Duration::from_secs(12));
             })
-            .await
-            .unwrap();
+            .await?;
 
             // Reload it
-            self.load_liquidator_lookup_table().await;
+            self.load_liquidator_lookup_table().await?;
         }
+        Ok(())
     }
 
     async fn create_init_reserve_lookup_table(
-        &mut self,
+        &self,
         keys: &[Pubkey],
         delay_fn: impl Fn(),
     ) -> Result<AddressLookupTableAccount> {

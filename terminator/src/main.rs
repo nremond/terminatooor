@@ -496,8 +496,13 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     let market_accs = klend_client
         .fetch_market_and_reserves(&ob.lending_market)
         .await?;
-    let mut reserves = market_accs.reserves;
+    let mut reserves = market_accs.reserves.clone();
     info!("Fetched {} reserves for market {}", reserves.len(), ob.lending_market);
+
+    // Load/update the liquidator lookup table for this market (reduces transaction size)
+    if let Err(e) = klend_client.load_lookup_table(&market_accs).await {
+        warn!("Failed to load lookup table: {:?}", e);
+    }
 
     // Ensure ATAs exist for all reserve mints before liquidation
     klend_client
@@ -761,11 +766,22 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             expected_collateral
         );
 
-        // Build transaction
-        let luts_count = luts.len();
+        // Build transaction with lookup tables
+        let swap_luts_count = luts.len();
         let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
+
+        // Add liquidator lookup table (for Kamino accounts)
+        let mut total_luts = 0;
+        if let Some(liquidator_lut) = klend_client.get_lookup_table() {
+            info!("Adding liquidator lookup table with {} addresses", liquidator_lut.addresses.len());
+            txn = txn.add_lookup_table(liquidator_lut);
+            total_luts += 1;
+        }
+
+        // Add swap lookup tables
         for lut in luts {
             txn = txn.add_lookup_table(lut);
+            total_luts += 1;
         }
 
         // Check transaction size before proceeding
@@ -779,11 +795,12 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 txn_size, MAX_TX_SIZE
             );
             info!(
-                "Debug: {} instructions, {} swap lookup tables. \
-                 TODO: Enable liquidator lookup table via LIQUIDATOR_LOOKUP_TABLE_FILE env var \
-                 and call klend_client.load_lookup_table() to reduce transaction size.",
+                "Debug: {} instructions, {} lookup tables ({} liquidator, {} swap). \
+                 Set LIQUIDATOR_LOOKUP_TABLE_FILE env var to enable lookup table compression.",
                 ixns.len(),
-                luts_count
+                total_luts,
+                if klend_client.get_lookup_table().is_some() { 1 } else { 0 },
+                swap_luts_count
             );
             return Ok(());
         }
@@ -1185,6 +1202,11 @@ struct MarketState {
 async fn load_market_state(klend_client: &KlendClient, market: &Pubkey) -> Result<MarketState> {
     let market_accs = klend_client.fetch_market_and_reserves(market).await?;
     let rts = klend_client.fetch_referrer_token_states().await?;
+
+    // Load/update the liquidator lookup table for this market (reduces transaction size)
+    if let Err(e) = klend_client.load_lookup_table(&market_accs).await {
+        warn!("Failed to load lookup table for market {}: {:?}", market, e);
+    }
 
     let OracleAccounts {
         pyth_accounts,

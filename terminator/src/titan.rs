@@ -329,7 +329,7 @@ impl TitanClient {
                 fee_bps: None,
             },
             update: Some(QuoteUpdateParams {
-                interval_ms: Some(100),
+                interval_ms: Some(200), // Titan minimum is 200ms
                 num_quotes: Some(1),
             }),
         });

@@ -268,15 +268,21 @@ impl Liquidator {
                         // Data too short - account is invalid or uninitialized
                         continue;
                     };
-                    let mint_data = match Mint::try_deserialize_unchecked(&mut mint_acc.data.as_ref()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!("Error deserializing mint {:?}: {:?}", mint, e);
-                            continue;
+                    // SPL Token Mint is 82 bytes, Token-2022 mints may have extensions
+                    // Use spl_token's unpack which handles this correctly
+                    let decimals = if mint_acc.data.len() >= 82 {
+                        match spl_token::state::Mint::unpack(&mint_acc.data[..82]) {
+                            Ok(m) => m.decimals,
+                            Err(_) => {
+                                // Likely a cToken or other non-standard mint, skip silently
+                                continue;
+                            }
                         }
+                    } else {
+                        // Data too short for a valid mint
+                        continue;
                     };
                     let balance = token_account.amount;
-                    let decimals = mint_data.decimals;
                     let ui_balance = balance as f64 / 10u64.pow(decimals as u32) as f64;
                     holdings.push(Holding {
                         mint: *mint,

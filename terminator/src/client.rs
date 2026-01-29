@@ -214,7 +214,7 @@ impl KlendClient {
         // we do not manage the addresses, that is done in a separate stage
 
         let filename = std::env::var("LIQUIDATOR_LOOKUP_TABLE_FILE")
-            .map_err(|_| anyhow!("LIQUIDATOR_LOOKUP_TABLE_FILE env var not set"))?;
+            .unwrap_or_else(|_| "liquidator_lookup_table.txt".to_string());
 
         if !std::path::Path::new(&filename).exists() {
             File::create(&filename)?;

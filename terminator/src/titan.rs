@@ -2046,4 +2046,152 @@ mod tests {
             "Direct routes scenario ({} bytes) exceeds limit ({} bytes)",
             direct_base64, max_base64_size);
     }
+
+    /// Test with REAL data from failed pSOL→CASH liquidation
+    /// This had only 2 swap instructions but was still 3216 bytes!
+    /// Run with: cargo test test_psol_cash_liquidation -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_psol_cash_liquidation() {
+        println!("\n=== pSOL→CASH Liquidation Test (Real Data) ===\n");
+
+        // From log:
+        // Obligation: FSXm9QKogbrMYM924JpYwgqDXf6tyUvRhBPyiGzU44Sc
+        // Market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
+        // debt_reserve=ApQkX32ULJUzszZDe986aobLDLMNDoGQK8tRm6oD6SsA (CASH)
+        // coll_reserve=HV9KsS5mB4b9CFhDJVKdfxWBAomYfUk5PeUsdgMQsUrB (pSOL)
+        // Swap: pSo1f9nQXWgXibFtKf7NWYxb5enAM4qfP6UJSiXRQfL -> CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH
+        // Instructions: 9 (only 2 swap instructions - direct route!)
+        // Transaction size: 3216 bytes (max 1644)
+        // Lookup table: "1 lookup tables (1 liquidator, 0 swap)" with "572 missing keys"
+
+        let actual_tx_size = 3216;
+        let max_size = 1644;
+        let num_instructions = 9;
+        let _num_swap_instructions = 2;
+
+        println!("Transaction details:");
+        println!("  Actual size: {} bytes (max {})", actual_tx_size, max_size);
+        println!("  Instructions: {} (2 swap)", num_instructions);
+        println!("  Lookup table: 1 (but 572 MISSING keys - accounts not in LUT!)");
+
+        // Key insight: 3216 base64 ≈ 2412 raw bytes
+        let raw_size = actual_tx_size * 3 / 4;
+        println!("  Raw size: ~{} bytes", raw_size);
+
+        // Estimate account count from raw size
+        let fixed_overhead = 64 + 3 + 32; // sig + header + blockhash
+        let instruction_estimate = 390; // 9 instructions with minimal data
+        let account_bytes = raw_size - fixed_overhead - instruction_estimate;
+        let account_count = account_bytes / 32;
+
+        println!("\nAccount analysis:");
+        println!("  Estimated accounts in tx: ~{}", account_count);
+        println!("  This is HIGH - the lookup table isn't working!");
+
+        // With WORKING lookup table (accounts ARE in it):
+        let accounts_if_in_lut = 50;
+        let accounts_outside_lut = account_count as i32 - accounts_if_in_lut;
+        let new_account_bytes = accounts_outside_lut * 32 + accounts_if_in_lut * 1 + 32;
+        let new_raw = fixed_overhead as i32 + instruction_estimate + new_account_bytes;
+        let new_base64 = (new_raw * 4 + 2) / 3;
+
+        println!("\nWith WORKING lookup table:");
+        println!("  Accounts in LUT: {}", accounts_if_in_lut);
+        println!("  Accounts outside: {}", accounts_outside_lut);
+        println!("  New base64 size: ~{} bytes", new_base64);
+        println!("  Status: {}", if new_base64 <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        // What if we ALSO had Titan swap LUT?
+        let swap_accounts_in_lut = 10;
+        let total_in_luts = accounts_if_in_lut + swap_accounts_in_lut;
+        let outside_both_luts = account_count as i32 - total_in_luts;
+        let both_luts_account_bytes = outside_both_luts.max(0) * 32 + total_in_luts * 1 + 64;
+        let both_luts_raw = fixed_overhead as i32 + instruction_estimate + both_luts_account_bytes;
+        let both_luts_base64 = (both_luts_raw * 4 + 2) / 3;
+
+        println!("\nWith BOTH lookup tables (Kamino + Swap):");
+        println!("  Accounts in both LUTs: {}", total_in_luts);
+        println!("  Accounts outside: {}", outside_both_luts);
+        println!("  New base64 size: ~{} bytes", both_luts_base64);
+        println!("  Status: {}", if both_luts_base64 <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        println!("\n=== CONCLUSION ===");
+        println!("The 3216 byte tx with only 9 instructions shows the problem is ACCOUNTS.");
+        println!("The LUT had 256 addresses but 572 were MISSING.");
+        println!("After deleting old LUT file and recreating, this should fit.");
+
+        assert!(both_luts_base64 <= max_size,
+            "With both LUTs, tx ({} bytes) should fit under {} bytes",
+            both_luts_base64, max_size);
+    }
+
+    /// Test with REAL data from failed SOL→USDC liquidation
+    /// This had 6 swap instructions and was 2228 bytes
+    /// Run with: cargo test test_sol_usdc_liquidation -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_sol_usdc_liquidation() {
+        println!("\n=== SOL→USDC Liquidation Test (Real Data) ===\n");
+
+        // From log:
+        // Obligation: 9zq8MrfKFo8fNpiApF9ymU57t4WV3VJGYQL5vXyNyJ9S
+        // debt_reserve=D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59 (USDC)
+        // coll_reserve=d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q (SOL)
+        // Swap: SOL -> USDC
+        // Instructions: 15 (6 swap instructions - multi-hop route)
+        // Transaction size: 2228 bytes (max 1644)
+
+        let actual_tx_size = 2228;
+        let max_size = 1644;
+
+        println!("Transaction details:");
+        println!("  Actual size: {} bytes (max {})", actual_tx_size, max_size);
+        println!("  Instructions: 15 (6 swap - multi-hop)");
+
+        let raw_size = actual_tx_size * 3 / 4;
+        println!("  Raw size: ~{} bytes", raw_size);
+
+        // With direct routes: fewer swap instructions
+        let fixed_overhead = 64 + 3 + 32;
+        let direct_instructions = 10; // vs 15
+        let direct_instruction_bytes = direct_instructions * 10 + direct_instructions * 15 + 400;
+
+        // Estimate accounts
+        let total_instruction_bytes = 15 * 10 + 15 * 15 + 900;
+        let account_bytes = raw_size - fixed_overhead - total_instruction_bytes;
+        let account_count = account_bytes / 32;
+
+        // With direct routes: fewer accounts too
+        let direct_accounts = account_count as i32 - 10; // fewer swap accounts
+
+        // With lookup tables
+        let in_lut = 40;
+        let outside_lut = direct_accounts - in_lut;
+        let lut_account_bytes = outside_lut.max(0) * 32 + in_lut * 1 + 32;
+        let lut_raw = fixed_overhead as i32 + direct_instruction_bytes + lut_account_bytes;
+        let lut_base64 = (lut_raw * 4 + 2) / 3;
+
+        println!("\nWith direct routes + WORKING lookup table:");
+        println!("  Accounts in LUT: {}", in_lut);
+        println!("  Base64 size: ~{} bytes", lut_base64);
+        println!("  Status: {}", if lut_base64 <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        // With both LUTs
+        let swap_in_lut = 8;
+        let total_in_luts = in_lut + swap_in_lut;
+        let outside_both = direct_accounts - total_in_luts;
+        let both_account_bytes = outside_both.max(0) * 32 + total_in_luts * 1 + 64;
+        let both_raw = fixed_overhead as i32 + direct_instruction_bytes + both_account_bytes;
+        let both_base64 = (both_raw * 4 + 2) / 3;
+
+        println!("\nWith direct routes + BOTH lookup tables:");
+        println!("  Total in LUTs: {}", total_in_luts);
+        println!("  Base64 size: ~{} bytes", both_base64);
+        println!("  Status: {}", if both_base64 <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        assert!(both_base64 <= max_size,
+            "With direct routes + both LUTs, tx ({} bytes) should fit under {} bytes",
+            both_base64, max_size);
+    }
 }

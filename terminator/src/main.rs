@@ -677,11 +677,12 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 "Getting swap instructions: {} -> {} amount={}",
                 coll_mint, debt_mint, expected_collateral
             );
+            // Use direct routes only to minimize transaction size (fewer swap instructions)
             let swap_result = match get_best_swap_instructions(
                 &coll_mint,
                 &debt_mint,
                 expected_collateral,
-                false,
+                true, // only_direct_routes - reduces swap instructions from 6+ to 1-2
                 Some((liquidation_swap_slippage_pct * 100.0) as u16),
                 None,
                 user,

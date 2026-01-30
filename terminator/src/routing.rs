@@ -140,8 +140,11 @@ pub async fn get_best_swap_instructions(
                     info!("max accounts {}", max_accounts);
 
                     // Fetch lookup tables from Titan's response
+                    info!("Titan returned {} lookup table addresses", route.address_lookup_tables.len());
                     if !route.address_lookup_tables.is_empty() {
+                        info!("Fetching swap lookup tables: {:?}", route.address_lookup_tables);
                         let swap_luts = fetch_lookup_tables(rpc_client, &route.address_lookup_tables).await;
+                        info!("Fetched {} swap lookup tables", swap_luts.len());
                         if !swap_luts.is_empty() {
                             decompiled_tx.lookup_tables = Some(swap_luts);
                         }

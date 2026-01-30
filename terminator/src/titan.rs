@@ -1472,6 +1472,127 @@ mod tests {
         }
     }
 
+    /// Test transaction size estimation with lookup table
+    /// Run with: cargo test test_lookup_table_size -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_lookup_table_size() {
+        println!("\n=== Testing Lookup Table Size Reduction ===\n");
+
+        // From the failing transaction logs:
+        // - Transaction size: 3312 bytes base64 (max 1644)
+        // - Market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
+        // - 55 reserves in market
+        // - 15 instructions
+
+        // Base64 encoding inflates by ~4/3, so:
+        // - 3312 base64 bytes ≈ 2484 raw bytes
+        // - 1644 base64 bytes ≈ 1232 raw bytes (Solana limit)
+
+        let original_base64_size: i32 = 3312;
+        let max_base64_size: i32 = 1644;
+        let original_raw_size: i32 = original_base64_size * 3 / 4; // ~2484
+        let max_raw_size: i32 = 1232;
+
+        println!("Original transaction:");
+        println!("  Base64 size: {} bytes", original_base64_size);
+        println!("  Raw size: ~{} bytes", original_raw_size);
+        println!("  Max allowed: {} bytes", max_raw_size);
+        println!("  Over limit by: {} bytes", original_raw_size - max_raw_size);
+
+        // In Solana transactions, accounts are listed ONCE in the header, not per instruction.
+        // The transaction message format:
+        // - Header (3 bytes): num_required_signatures, num_readonly_signed, num_readonly_unsigned
+        // - Account keys (N * 32 bytes): unique accounts used by all instructions
+        // - Recent blockhash (32 bytes)
+        // - Instructions (variable): each has program_id_index (1), accounts (indices), data
+        //
+        // For a flash loan liquidation with ~70 unique accounts:
+        // - Account keys: 70 * 32 = 2240 bytes (this is the main size)
+        // - Instructions: ~300 bytes (indices are 1 byte each)
+        // - Overhead: ~100 bytes
+        // Total: ~2640 bytes raw, which matches our ~2484 estimate
+
+        let unique_accounts: i32 = 70; // Estimate of unique accounts in the failing tx
+        let accounts_in_lut: i32 = 340; // Addresses in lookup table (55 reserves * 6 + extras)
+
+        // Without LUT: all accounts are full 32-byte pubkeys
+        // With LUT: accounts in LUT are 1-byte indices, others still 32 bytes
+        // LUT overhead: 32 bytes per LUT address in message
+
+        let kamino_accounts: i32 = 50; // Accounts that would be in Kamino LUT
+        let swap_accounts: i32 = 15;   // Accounts only in swap instructions
+        let other_accounts: i32 = 5;   // System program, sysvar, etc.
+
+        println!("\nAccount breakdown estimate:");
+        println!("  Unique accounts in tx: ~{}", unique_accounts);
+        println!("  Kamino-related (in LUT): ~{}", kamino_accounts);
+        println!("  Swap-related: ~{}", swap_accounts);
+        println!("  System/other: ~{}", other_accounts);
+        println!("  Addresses available in LUT: ~{}", accounts_in_lut);
+
+        // Size calculation for account keys section:
+        // Without LUT: all 32 bytes each
+        let size_without_lut: i32 = unique_accounts * 32;
+
+        // With LUT: Kamino accounts become 1-byte indices, others stay 32 bytes
+        // Plus 32 bytes for the LUT address itself
+        let size_with_lut: i32 = kamino_accounts * 1 + (swap_accounts + other_accounts) * 32 + 32;
+
+        let savings: i32 = size_without_lut - size_with_lut;
+
+        println!("\nSize calculation (account keys section):");
+        println!("  Without LUT: {} bytes", size_without_lut);
+        println!("  With LUT: {} bytes", size_with_lut);
+        println!("  Savings: {} bytes", savings);
+
+        // Estimate new transaction size
+        // Non-account parts: instructions data, signatures, blockhash, header
+        let instruction_data: i32 = 400; // 15 instructions with data
+        let signatures: i32 = 64;        // 1 signature
+        let header_and_blockhash: i32 = 35;
+        let non_account_overhead: i32 = instruction_data + signatures + header_and_blockhash;
+
+        let estimated_old_size: i32 = size_without_lut + non_account_overhead;
+        let estimated_new_size: i32 = size_with_lut + non_account_overhead;
+        let estimated_new_base64: i32 = estimated_new_size * 4 / 3;
+
+        println!("\nTransaction size estimate:");
+        println!("  Non-account overhead: ~{} bytes", non_account_overhead);
+        println!("  Old raw size: ~{} bytes (actual: {})", estimated_old_size, original_raw_size);
+        println!("  New raw size: ~{} bytes", estimated_new_size);
+        println!("  New base64 size: ~{} bytes", estimated_new_base64);
+        println!("  Max allowed: {} bytes", max_base64_size);
+
+        if estimated_new_base64 < max_base64_size {
+            println!("\n✓ Transaction SHOULD FIT with lookup table!");
+            println!("  Headroom: {} bytes ({:.1}% of max)",
+                max_base64_size - estimated_new_base64,
+                (1.0 - estimated_new_base64 as f64 / max_base64_size as f64) * 100.0
+            );
+        } else {
+            println!("\n✗ Transaction may still be too large");
+            println!("  Over limit by: {} bytes", estimated_new_base64 - max_base64_size);
+        }
+
+        // What if swap also has a LUT?
+        println!("\n--- With BOTH Kamino and Swap LUTs ---");
+        let size_with_both_luts: i32 = kamino_accounts * 1 + swap_accounts * 1 + other_accounts * 32 + 64; // +64 for 2 LUTs
+        let new_size_both: i32 = size_with_both_luts + non_account_overhead;
+        let new_base64_both: i32 = new_size_both * 4 / 3;
+        println!("  Account keys with both LUTs: {} bytes", size_with_both_luts);
+        println!("  New raw size: ~{} bytes", new_size_both);
+        println!("  New base64 size: ~{} bytes", new_base64_both);
+        if new_base64_both < max_base64_size {
+            println!("  ✓ Would fit with headroom: {} bytes", max_base64_size - new_base64_both);
+        }
+
+        println!("\n=== Conclusion ===");
+        println!("With Kamino LUT alone: Transaction should fit (~{} bytes < {} max)", estimated_new_base64, max_base64_size);
+        println!("The lookup table provides ~{} bytes savings, reducing size by {:.0}%",
+            savings, (savings as f64 / size_without_lut as f64) * 100.0);
+    }
+
     /// Test reserve lookup for a specific obligation (Issue 2 investigation)
     /// This reproduces the exact scenario from the failing liquidation
     /// Run with: RPC_URL=<mainnet-url> cargo test test_reserve_lookup -- --nocapture --ignored
@@ -1638,5 +1759,291 @@ mod tests {
             println!("FAILURE: Some reserves are missing!");
             println!("This explains the 'reserve not found' error");
         }
+    }
+
+    /// Test transaction size with lookup table using REAL data from failed liquidation
+    /// This simulates the exact scenario from the 3608 byte failed transaction
+    /// Run with: cargo test test_flash_loan_liquidation_tx_size -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_flash_loan_liquidation_tx_size() {
+        use std::collections::HashSet;
+
+        println!("\n=== Flash Loan Liquidation Transaction Size Test ===\n");
+
+        // Data from the ACTUAL failed liquidation log:
+        // 2026-01-30T04:58:14.219874Z WARN Transaction too large: 3608 bytes (max 1644)
+        // 2026-01-30T04:58:14.219890Z INFO Debug: 15 instructions, 1 lookup tables (1 liquidator, 0 swap)
+        // Market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF (55 reserves)
+        // debt_reserve=ESCkPWKHmgNE7Msf77n9yzqJd5kQVWWGy3o5Mgxhvavp (USDG)
+        // coll_reserve=d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q (SOL)
+        // Lookup table had 256 addresses but 572 MISSING keys
+
+        let failed_tx_base64_size = 3608;
+        let max_base64_size = 1644;
+        let num_instructions = 15;
+        let num_reserves = 55;
+        let num_liquidator_atas = 110;
+
+        println!("Failed transaction details:");
+        println!("  Base64 size: {} bytes (max {})", failed_tx_base64_size, max_base64_size);
+        println!("  Instructions: {}", num_instructions);
+        println!("  Reserves in market: {}", num_reserves);
+        println!("  Liquidator ATAs: {}", num_liquidator_atas);
+
+        // Accounts needed for a flash loan liquidation (15 instructions):
+        // 1. flash_borrow_reserve_liquidity - debt reserve accounts
+        // 2-5. init_obligation_farm, refresh_reserve (x2), refresh_obligation
+        // 6. refresh_obligation_farms
+        // 7. liquidate_obligation_and_redeem_reserve_collateral
+        // 8-13. swap instructions (6 instructions)
+        // 14. flash_repay_reserve_liquidity
+        // 15. (possibly one more instruction)
+
+        // Unique accounts breakdown:
+        let kamino_unique_accounts = vec![
+            // System/common
+            ("lending_market", 1),
+            ("lending_market_authority", 1),
+            ("sysvar_instructions", 1),
+            ("token_program", 1),
+            ("system_program", 1),
+            ("klend_program", 1),
+
+            // Debt reserve accounts
+            ("debt_reserve", 1),
+            ("debt_reserve_liquidity_supply", 1),
+            ("debt_reserve_liquidity_fee_vault", 1),
+            ("debt_reserve_liquidity_mint", 1),
+
+            // Collateral reserve accounts
+            ("coll_reserve", 1),
+            ("coll_reserve_collateral_supply", 1),
+            ("coll_reserve_collateral_mint", 1),
+            ("coll_reserve_liquidity_supply", 1),
+
+            // Obligation
+            ("obligation", 1),
+            ("obligation_farm_state", 1),
+
+            // Liquidator accounts
+            ("liquidator", 1),
+            ("liquidator_debt_ata", 1),
+            ("liquidator_coll_ata", 1),
+
+            // Oracles (assuming 2 per reserve)
+            ("debt_oracle", 1),
+            ("coll_oracle", 1),
+        ];
+
+        let kamino_accounts_count: i32 = kamino_unique_accounts.iter().map(|(_, c)| c).sum();
+        println!("\nKamino accounts in transaction: {}", kamino_accounts_count);
+
+        // Swap accounts (from Titan DEX aggregator)
+        // Typically includes: DEX program, pool accounts, token accounts, etc.
+        let swap_accounts = vec![
+            ("swap_program_1", 1),  // e.g., Raydium, Orca
+            ("swap_program_2", 1),  // might use multiple DEXes
+            ("pool_state", 2),
+            ("pool_token_vault_a", 2),
+            ("pool_token_vault_b", 2),
+            ("pool_authority", 2),
+            ("pool_fee_account", 1),
+            ("intermediate_token_account", 2),
+        ];
+        let swap_accounts_count: i32 = swap_accounts.iter().map(|(_, c)| c).sum();
+        println!("Swap accounts in transaction: {}", swap_accounts_count);
+
+        let total_unique_accounts = kamino_accounts_count + swap_accounts_count;
+        println!("Total unique accounts: {}", total_unique_accounts);
+
+        // Calculate transaction size WITHOUT lookup tables
+        println!("\n--- Transaction Size WITHOUT Lookup Tables ---");
+
+        // Solana transaction structure:
+        // - Signature (64 bytes)
+        // - Message header (3 bytes)
+        // - Account keys (N * 32 bytes)
+        // - Recent blockhash (32 bytes)
+        // - Instruction count (compact-u16)
+        // - Instructions (variable)
+
+        let signature_size = 64;
+        let header_size = 3;
+        let account_keys_size = total_unique_accounts * 32;
+        let blockhash_size = 32;
+
+        // Estimate instruction data size
+        // Each instruction: program_id_index (1) + accounts_len (compact-u16) + accounts (N * 1) + data_len + data
+        // Flash borrow/repay: ~50 bytes data each
+        // Refresh reserve: ~10 bytes each
+        // Liquidate: ~30 bytes
+        // Swap: ~100-200 bytes each (6 instructions with multi-hop routes)
+        let instruction_overhead = num_instructions * 10; // program_id_index + accounts overhead
+        let instruction_account_refs = total_unique_accounts * 2; // accounts referenced in instructions (some multiple times)
+        let instruction_data_multi_hop = 50 + 50 + 10 * 4 + 30 + 150 * 6; // 6 swap instructions
+        let instructions_size = instruction_overhead + instruction_account_refs + instruction_data_multi_hop;
+
+        // With direct routes only: 1-2 swap instructions instead of 6
+        let num_instructions_direct = 10; // flash_borrow + 4 refreshes + liquidate + 2 swaps + flash_repay
+        let instruction_data_direct = 50 + 50 + 10 * 4 + 30 + 150 * 2; // 2 swap instructions
+        let instructions_size_direct = num_instructions_direct * 10 + total_unique_accounts * 2 + instruction_data_direct;
+
+        let raw_size_no_lut = signature_size + header_size + account_keys_size + blockhash_size + instructions_size;
+        let base64_size_no_lut = (raw_size_no_lut * 4 + 2) / 3; // base64 encoding
+
+        println!("  Signature: {} bytes", signature_size);
+        println!("  Header: {} bytes", header_size);
+        println!("  Account keys ({} * 32): {} bytes", total_unique_accounts, account_keys_size);
+        println!("  Blockhash: {} bytes", blockhash_size);
+        println!("  Instructions: ~{} bytes", instructions_size);
+        println!("  Total raw: ~{} bytes", raw_size_no_lut);
+        println!("  Total base64: ~{} bytes", base64_size_no_lut);
+
+        // Calculate with OLD lookup table (256 addresses but WRONG ones)
+        println!("\n--- With OLD Lookup Table (wrong accounts) ---");
+        // The old LUT had 256 addresses but they were for ALL reserves, not just the ones in this tx
+        // So 572 keys were "missing" - meaning accounts in the tx weren't in the LUT
+        let accounts_in_old_lut = 0; // effectively 0 because the accounts weren't matching
+        let accounts_not_in_old_lut = total_unique_accounts;
+        let lut_overhead = 32; // LUT address itself
+
+        let account_keys_with_old_lut = accounts_not_in_old_lut * 32 + accounts_in_old_lut * 1 + lut_overhead;
+        let raw_size_old_lut = signature_size + header_size + account_keys_with_old_lut + blockhash_size + instructions_size;
+        let base64_size_old_lut = (raw_size_old_lut * 4 + 2) / 3;
+
+        println!("  Accounts in LUT: {} (but WRONG accounts)", accounts_in_old_lut);
+        println!("  Accounts NOT in LUT: {}", accounts_not_in_old_lut);
+        println!("  Account keys section: {} bytes", account_keys_with_old_lut);
+        println!("  Total base64: ~{} bytes (actual was {})", base64_size_old_lut, failed_tx_base64_size);
+
+        // Calculate with NEW lookup table (correct accounts)
+        println!("\n--- With NEW Lookup Table (correct accounts) ---");
+
+        // NEW collect_keys only includes:
+        // - Reserve pubkeys (55) - but only 2 are used in this tx
+        // - Liquidator ATAs (110) - but only 2 are used in this tx
+        // - Lending market info (~5)
+        // Total in LUT: ~170 keys
+
+        // For THIS transaction, the accounts that would be in the LUT:
+        let accounts_in_new_lut = vec![
+            "lending_market",           // in LUT
+            "lending_market_authority", // in LUT
+            "debt_reserve",             // in LUT (reserve pubkey)
+            "coll_reserve",             // in LUT (reserve pubkey)
+            "liquidator_debt_ata",      // in LUT (liquidator ATA)
+            "liquidator_coll_ata",      // in LUT (liquidator ATA)
+        ];
+        let in_lut_count = accounts_in_new_lut.len() as i32;
+
+        // Accounts NOT in the new LUT (vaults, oracles, swap accounts):
+        let not_in_lut_count = total_unique_accounts - in_lut_count;
+
+        println!("  Accounts IN new LUT: {} {:?}", in_lut_count, accounts_in_new_lut);
+        println!("  Accounts NOT in LUT: {} (vaults, oracles, swap, etc.)", not_in_lut_count);
+
+        let account_keys_with_new_lut = not_in_lut_count * 32 + in_lut_count * 1 + lut_overhead;
+        let raw_size_new_lut = signature_size + header_size + account_keys_with_new_lut + blockhash_size + instructions_size;
+        let base64_size_new_lut = (raw_size_new_lut * 4 + 2) / 3;
+
+        println!("  Account keys section: {} bytes", account_keys_with_new_lut);
+        println!("  Total raw: ~{} bytes", raw_size_new_lut);
+        println!("  Total base64: ~{} bytes", base64_size_new_lut);
+
+        // Calculate with BOTH lookup tables (Kamino + Titan swap)
+        println!("\n--- With BOTH Lookup Tables (Kamino + Swap) ---");
+
+        // If Titan also provides a LUT with swap accounts:
+        let swap_accounts_in_titan_lut = swap_accounts_count;
+        let kamino_accounts_in_lut = in_lut_count;
+        let total_in_luts = swap_accounts_in_titan_lut + kamino_accounts_in_lut;
+        let not_in_any_lut = total_unique_accounts - total_in_luts;
+
+        println!("  Kamino accounts in LUT: {}", kamino_accounts_in_lut);
+        println!("  Swap accounts in Titan LUT: {}", swap_accounts_in_titan_lut);
+        println!("  Accounts NOT in any LUT: {} (vaults, oracles)", not_in_any_lut);
+
+        let two_lut_overhead = 64; // 2 LUT addresses
+        let account_keys_both_luts = not_in_any_lut * 32 + total_in_luts * 1 + two_lut_overhead;
+        let raw_size_both_luts = signature_size + header_size + account_keys_both_luts + blockhash_size + instructions_size;
+        let base64_size_both_luts = (raw_size_both_luts * 4 + 2) / 3;
+
+        println!("  Account keys section: {} bytes", account_keys_both_luts);
+        println!("  Total raw: ~{} bytes", raw_size_both_luts);
+        println!("  Total base64: ~{} bytes", base64_size_both_luts);
+
+        // Best case: include vaults in the LUT too
+        println!("\n--- BEST CASE: All Kamino accounts in LUT ---");
+
+        // If we include debt/coll reserve vaults and mints in the LUT:
+        let all_kamino_in_lut = kamino_accounts_count;
+        let only_swap_not_in_lut = swap_accounts_count;
+
+        let account_keys_best = only_swap_not_in_lut * 32 + all_kamino_in_lut * 1 + lut_overhead;
+        let raw_size_best = signature_size + header_size + account_keys_best + blockhash_size + instructions_size;
+        let base64_size_best = (raw_size_best * 4 + 2) / 3;
+
+        println!("  All Kamino accounts in LUT: {}", all_kamino_in_lut);
+        println!("  Only swap accounts outside: {}", only_swap_not_in_lut);
+        println!("  Account keys section: {} bytes", account_keys_best);
+        println!("  Total base64: ~{} bytes", base64_size_best);
+
+        // Calculate with DIRECT ROUTES (fewer swap instructions)
+        println!("\n--- With DIRECT ROUTES (fewer swaps) + Both LUTs ---");
+
+        // Direct routes = 2 swap instructions instead of 6
+        // This dramatically reduces instruction data
+        let direct_route_swap_accounts = 8; // fewer swap accounts with direct route
+        let direct_total_accounts = kamino_accounts_count + direct_route_swap_accounts;
+        let direct_accounts_in_luts = kamino_accounts_count + direct_route_swap_accounts;
+        let direct_not_in_luts = 10; // vaults, oracles still outside
+
+        let direct_account_keys = direct_not_in_luts * 32 + direct_accounts_in_luts * 1 + 64;
+        let direct_raw = signature_size + header_size + direct_account_keys + blockhash_size + instructions_size_direct;
+        let direct_base64 = (direct_raw * 4 + 2) / 3;
+
+        println!("  Instructions: {} (was {})", num_instructions_direct, num_instructions);
+        println!("  Instruction data: ~{} bytes (was ~{})", instruction_data_direct, instruction_data_multi_hop);
+        println!("  Total accounts: {}", direct_total_accounts);
+        println!("  Account keys section: {} bytes", direct_account_keys);
+        println!("  Total raw: ~{} bytes", direct_raw);
+        println!("  Total base64: ~{} bytes", direct_base64);
+
+        // Summary
+        println!("\n=== SUMMARY ===");
+        println!("Max allowed: {} bytes base64", max_base64_size);
+        println!("");
+        println!("Multi-hop (6 swaps):");
+        println!("  No LUT:           ~{} bytes - {}", base64_size_no_lut,
+            if base64_size_no_lut <= max_base64_size { "✓ FITS" } else { "✗ TOO LARGE" });
+        println!("  Old LUT (wrong):  ~{} bytes - {} (actual: {})", base64_size_old_lut,
+            if base64_size_old_lut <= max_base64_size { "✓ FITS" } else { "✗ TOO LARGE" }, failed_tx_base64_size);
+        println!("  New LUT (basic):  ~{} bytes - {}", base64_size_new_lut,
+            if base64_size_new_lut <= max_base64_size { "✓ FITS" } else { "✗ TOO LARGE" });
+        println!("  Both LUTs:        ~{} bytes - {}", base64_size_both_luts,
+            if base64_size_both_luts <= max_base64_size { "✓ FITS" } else { "✗ TOO LARGE" });
+        println!("  Best case:        ~{} bytes - {}", base64_size_best,
+            if base64_size_best <= max_base64_size { "✓ FITS" } else { "✗ TOO LARGE" });
+        println!("");
+        println!("Direct routes (2 swaps):");
+        println!("  With both LUTs:   ~{} bytes - {}", direct_base64,
+            if direct_base64 <= max_base64_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        // Recommendation
+        println!("\n=== RECOMMENDATION ===");
+        if direct_base64 <= max_base64_size {
+            println!("✓ Use DIRECT ROUTES ONLY (only_direct_routes=true) to fit transaction");
+            println!("  This reduces swap instructions from 6 to 1-2");
+        } else if base64_size_best <= max_base64_size {
+            println!("⚠ Need optimal lookup tables + direct routes");
+        } else {
+            println!("✗ Transaction cannot fit - need to split or use different approach");
+        }
+
+        // Assert that direct routes would fit
+        assert!(direct_base64 <= max_base64_size,
+            "Direct routes scenario ({} bytes) exceeds limit ({} bytes)",
+            direct_base64, max_base64_size);
     }
 }

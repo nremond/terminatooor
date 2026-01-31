@@ -24,6 +24,15 @@ pub fn refresh_reserve<'a>(
     switchboard_feed_infos: &HashMap<Pubkey, AccountInfo<'a>>,
     scope_price_infos: &HashMap<Pubkey, AccountInfo<'a>>,
 ) -> Result<()> {
+    // Skip if reserve was already refreshed at a newer slot (prevents MathOverflow in slots_elapsed)
+    if reserve.last_update.slots_elapsed(clock.slot).is_err() {
+        warn!(
+            "Reserve {} last_update slot is ahead of clock slot {}, skipping refresh",
+            key, clock.slot
+        );
+        return Ok(());
+    }
+
     if kamino_lending::lending_market::lending_operations::is_price_refresh_needed(
         reserve,
         lending_market,

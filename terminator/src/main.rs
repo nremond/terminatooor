@@ -612,7 +612,10 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         }
     };
 
-    // Simulate liquidation
+    // Save original obligation for building instructions (simulation will mutate it)
+    let original_obligation = *obligation.state.borrow();
+
+    // Simulate liquidation (this mutates obligation)
     let res = kamino_lending::lending_market::lending_operations::liquidate_and_redeem(
         &lending_market.state.borrow(),
         &debt_reserve,
@@ -626,6 +629,9 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     );
 
     println!("Simulating the liquidation {:#?}", res);
+
+    // Use original obligation for instructions (before simulation mutated it)
+    let obligation_for_ix = StateWithKey::new(original_obligation, obligation.key);
 
     if res.is_ok() {
         let user = klend_client.liquidator.wallet.pubkey();
@@ -655,13 +661,13 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         // Flash borrow is at index 0 in our list, but build_with_budget_and_fee prepends ComputeBudget ixs
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
-        // 2. Liquidation instructions (includes refresh)
+        // 2. Liquidation instructions (use original obligation, not the simulation-mutated one)
         let liquidate_ixns = klend_client
             .liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
                 debt_reserve.clone(),
                 coll_reserve.clone(),
-                obligation.clone(),
+                obligation_for_ix.clone(),
                 liquidate_amount,
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
@@ -749,14 +755,14 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             }
         }
 
-        // 4. Flash repay (borrowed amount + fee)
+        // 4. Flash repay (instruction data must match borrow amount exactly; fee is handled by token transfer)
         let flash_repay_ix = instructions::flash_repay_reserve_liquidity_ix(
             &klend_client.program_id,
             &lending_market.key,
             &debt_reserve,
             &debt_token_ata,
             &klend_client.liquidator,
-            repay_amount,
+            liquidate_amount, // Must match borrow amount - fee is added automatically
             flash_borrow_index,
             None, // referrer_token_state
             None, // referrer_account
@@ -844,10 +850,18 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
         // Check simulation result for errors
         if let Some(err) = res.value.err {
-            warn!("Simulation returned error: {:?}", err);
-            if let Some(logs) = &res.value.logs {
-                for log in logs.iter().rev().take(5) {
-                    warn!("  Log: {}", log);
+            // Check if obligation became healthy (race condition - expected behavior)
+            let is_healthy_error = res.value.logs.as_ref().map_or(false, |logs| {
+                logs.iter().any(|log| log.contains("ObligationHealthy"))
+            });
+            if is_healthy_error {
+                info!("Obligation recovered before liquidation (LTV now healthy)");
+            } else {
+                warn!("Simulation returned error: {:?}", err);
+                if let Some(logs) = &res.value.logs {
+                    for log in logs.iter().rev().take(5) {
+                        warn!("  Log: {}", log);
+                    }
                 }
             }
             return Ok(());
@@ -1015,7 +1029,10 @@ async fn liquidate_fast(
         }
     };
 
-    // Simulate liquidation
+    // Save original obligation for building instructions (simulation will mutate it)
+    let original_obligation = *obligation_state.state.borrow();
+
+    // Simulate liquidation (this mutates obligation_state)
     let res = kamino_lending::lending_market::lending_operations::liquidate_and_redeem(
         &lending_market.state.borrow(),
         &debt_reserve,
@@ -1029,6 +1046,9 @@ async fn liquidate_fast(
     );
 
     println!("Simulating the liquidation {:#?}", res);
+
+    // Use original obligation for instructions (before simulation mutated it)
+    let obligation_for_ix = StateWithKey::new(original_obligation, *obligation_pubkey);
 
     if res.is_ok() {
         let user = klend_client.liquidator.wallet.pubkey();
@@ -1064,13 +1084,13 @@ async fn liquidate_fast(
         // Flash borrow is at index 0 in our list, but build_with_budget_and_fee prepends ComputeBudget ixs
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
-        // 2. Build liquidation instructions
+        // 2. Build liquidation instructions (use original obligation, not the simulation-mutated one)
         let liquidate_ixns = klend_client
             .liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
                 debt_reserve.clone(),
                 coll_reserve.clone(),
-                obligation_state.clone(),
+                obligation_for_ix.clone(),
                 liquidate_amount,
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
@@ -1147,14 +1167,14 @@ async fn liquidate_fast(
             }
         }
 
-        // 4. Flash repay
+        // 4. Flash repay (instruction data must match borrow amount exactly; fee is handled by token transfer)
         let flash_repay_ix = instructions::flash_repay_reserve_liquidity_ix(
             &klend_client.program_id,
             &lending_market.key,
             &debt_reserve,
             &debt_token_ata,
             &klend_client.liquidator,
-            repay_amount,
+            liquidate_amount, // Must match borrow amount - fee is added automatically
             flash_borrow_index,
             None,
             None,
@@ -1241,10 +1261,18 @@ async fn liquidate_fast(
         };
 
         if let Some(err) = res.value.err {
-            warn!("Simulation returned error: {:?}", err);
-            if let Some(logs) = &res.value.logs {
-                for log in logs.iter().rev().take(5) {
-                    warn!("  Log: {}", log);
+            // Check if obligation became healthy (race condition - expected behavior)
+            let is_healthy_error = res.value.logs.as_ref().map_or(false, |logs| {
+                logs.iter().any(|log| log.contains("ObligationHealthy"))
+            });
+            if is_healthy_error {
+                info!("Obligation recovered before liquidation (LTV now healthy)");
+            } else {
+                warn!("Simulation returned error: {:?}", err);
+                if let Some(logs) = &res.value.logs {
+                    for log in logs.iter().rev().take(5) {
+                        warn!("  Log: {}", log);
+                    }
                 }
             }
             return Ok(());

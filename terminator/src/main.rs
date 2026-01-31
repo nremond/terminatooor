@@ -662,6 +662,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
         // 2. Liquidation instructions (use original obligation, not the simulation-mutated one)
+        // Skip post-farm refresh to fit within tx size limit for flash loan liquidations
         let liquidate_ixns = klend_client
             .liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
@@ -671,6 +672,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 liquidate_amount,
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
+                true, // skip_post_farm_refresh for flash loan tx size
             )
             .await?;
         ixns.extend_from_slice(&liquidate_ixns);
@@ -1085,6 +1087,7 @@ async fn liquidate_fast(
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
         // 2. Build liquidation instructions (use original obligation, not the simulation-mutated one)
+        // Skip post-farm refresh to fit within tx size limit for flash loan liquidations
         let liquidate_ixns = klend_client
             .liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
@@ -1094,6 +1097,7 @@ async fn liquidate_fast(
                 liquidate_amount,
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
+                true, // skip_post_farm_refresh for flash loan tx size
             )
             .await?;
         ixns.extend_from_slice(&liquidate_ixns);

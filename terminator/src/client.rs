@@ -479,6 +479,11 @@ impl KlendClient {
         px::fetch_prices(&mints, usd_mint, amount).await
     }
 
+    /// Build liquidation instructions with optional post-farm refresh.
+    ///
+    /// # Arguments
+    /// * `skip_post_farm_refresh` - If true, omits post-liquidation farm refresh instructions
+    ///   to reduce transaction size. Use for flash loan liquidations.
     #[allow(clippy::too_many_arguments)]
     pub async fn liquidate_obligation_and_redeem_reserve_collateral_ixns(
         &self,
@@ -489,6 +494,7 @@ impl KlendClient {
         liquidity_amount: u64,
         min_acceptable_received_coll_amount: u64,
         max_allowed_ltv_override_pct_opt: Option<u64>,
+        skip_post_farm_refresh: bool,
     ) -> Result<Vec<Instruction>> {
         let liquidate_ix = instructions::liquidate_obligation_and_redeem_reserve_collateral_ix(
             &self.program_id,
@@ -508,6 +514,7 @@ impl KlendClient {
                 &[ReserveFarmKind::Collateral, ReserveFarmKind::Debt],
                 &obligation,
                 &self.liquidator.wallet.clone(),
+                skip_post_farm_refresh,
             )
             .await;
 
@@ -543,6 +550,7 @@ impl KlendClient {
                 liquidity_amount,
                 min_acceptable_received_coll_amount,
                 max_allowed_ltv_override_pct_opt,
+                false, // Include post farm refresh for non-flash loan liquidations
             )
             .await?;
 
@@ -556,19 +564,25 @@ impl KlendClient {
         txn.build_with_budget_and_fee(&[]).await.map_err(Into::into)
     }
 
+    /// Wraps an obligation instruction with necessary refresh/farm instructions.
+    ///
+    /// # Arguments
+    /// * `skip_post_farm_refresh` - If true, skips post-liquidation farm refresh to reduce tx size.
+    ///   Use this for flash loan liquidations where the tx is already at the size limit.
     pub async fn wrap_obligation_instruction_with_farms(
         &self,
         reserve_accts: &[&StateWithKey<Reserve>],
         farm_modes: &[ReserveFarmKind],
         obligation: &StateWithKey<Obligation>,
         payer: &Arc<Keypair>,
+        skip_post_farm_refresh: bool,
     ) -> (Vec<InstructionBlocks>, Vec<InstructionBlocks>) {
         // If has farms, also do init farm obligations
         // Always do refresh_reserve
         // Always do refresh_obligation
-        // If has farms, also do refresh farms
+        // If has farms, also do refresh farms (pre)
         // Then this ix
-        // If has farms, also do refresh farms
+        // If has farms, also do refresh farms (post) - unless skip_post_farm_refresh
 
         let mut pre_instructions = vec![];
         let mut post_instructions = vec![];
@@ -704,7 +718,10 @@ impl KlendClient {
                 println!("pre_ixs refresh_obligation_farms {:?}", farm);
 
                 pre_instructions.push(refresh_farms_ix.clone());
-                post_instructions.push(refresh_farms_ix);
+                // Skip post farm refresh for flash loan liquidations to fit in tx size limit
+                if !skip_post_farm_refresh {
+                    post_instructions.push(refresh_farms_ix);
+                }
             }
         }
 

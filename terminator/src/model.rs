@@ -33,3 +33,51 @@ impl<T> AnyAccountLoader<'_, T> for StateWithKey<T> {
         self.key
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that demonstrates why we need to save the original state before simulation.
+    /// StateWithKey uses Rc<RefCell<T>>, so clone() shares the same underlying data.
+    /// Any mutation through borrow_mut() affects all clones.
+    #[test]
+    fn test_state_with_key_clone_shares_mutation() {
+        let key = Pubkey::new_unique();
+        let state = StateWithKey::new(vec![1, 2, 3, 4], key);
+
+        // Clone shares the same RefCell
+        let cloned = state.clone();
+
+        // Mutate through the original
+        state.state.borrow_mut().pop();
+
+        // Clone sees the mutation!
+        assert_eq!(*cloned.state.borrow(), vec![1, 2, 3]);
+        assert_eq!(cloned.state.borrow().len(), 3);
+    }
+
+    /// Test the fix pattern: save original value before mutation
+    #[test]
+    fn test_save_before_mutation_preserves_original() {
+        let key = Pubkey::new_unique();
+        let state = StateWithKey::new(vec![1, 2, 3, 4], key);
+
+        // Save original value BEFORE mutation
+        let original = state.state.borrow().clone();
+
+        // Mutate the state
+        state.state.borrow_mut().pop();
+
+        // Original value preserved
+        assert_eq!(original, vec![1, 2, 3, 4]);
+        assert_eq!(original.len(), 4);
+
+        // State was mutated
+        assert_eq!(*state.state.borrow(), vec![1, 2, 3]);
+
+        // Create new StateWithKey from original for instructions
+        let for_instructions = StateWithKey::new(original, key);
+        assert_eq!(for_instructions.state.borrow().len(), 4);
+    }
+}

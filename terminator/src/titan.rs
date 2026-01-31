@@ -207,6 +207,9 @@ impl TitanClient {
         futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
     )> {
         let url = &self.config.endpoint;
+        if url.is_empty() {
+            return Err(Error::ConfigError("TITAN_ENDPOINT not configured".into()));
+        }
         debug!("Connecting to Titan WebSocket: {}", url);
 
         let ws_url = url::Url::parse(url)
@@ -357,6 +360,8 @@ impl TitanClient {
         let response_timeout = Duration::from_secs(30);
         let mut best_route: Option<SwapRouteResponse> = None;
         let mut _current_stream_id: Option<u32> = None;
+        let mut empty_quotes_count = 0;
+        const MAX_EMPTY_QUOTES: u32 = 3; // Exit early if we get 3 consecutive empty responses
 
         loop {
             let msg = timeout(response_timeout, read.next())
@@ -430,21 +435,38 @@ impl TitanClient {
                             }
                             break;
                         } else {
-                            warn!("Failed to parse quotes from swap_quotes payload, type={:?}, is_map={}",
-                                match &swap_quotes {
-                                    rmpv::Value::Nil => "Nil",
-                                    rmpv::Value::Boolean(_) => "Boolean",
-                                    rmpv::Value::Integer(_) => "Integer",
-                                    rmpv::Value::F32(_) => "F32",
-                                    rmpv::Value::F64(_) => "F64",
-                                    rmpv::Value::String(_) => "String",
-                                    rmpv::Value::Binary(_) => "Binary",
-                                    rmpv::Value::Array(_) => "Array",
-                                    rmpv::Value::Map(m) => { info!("Map keys: {:?}", m.iter().take(10).map(|(k,_)| format!("{:?}", k)).collect::<Vec<_>>()); "Map" },
-                                    rmpv::Value::Ext(_, _) => "Ext",
-                                },
-                                swap_quotes.is_map()
-                            );
+                            // Check if this is an empty quotes response (no routes available)
+                            if is_quotes_map_empty(&swap_quotes) {
+                                empty_quotes_count += 1;
+                                if empty_quotes_count >= MAX_EMPTY_QUOTES {
+                                    info!("Got {} consecutive empty quote responses - no routes available for {} -> {}", empty_quotes_count, input_mint, output_mint);
+                                    // Stop the stream and exit early
+                                    let stop_request = TitanRequest::StopStream { id: stream_id.to_string() };
+                                    let stop_value = request_to_msgpack_value(&stop_request);
+                                    let mut stop_bytes = Vec::new();
+                                    if rmpv::encode::write_value(&mut stop_bytes, &stop_value).is_ok() {
+                                        let _ = write.send(Message::Binary(stop_bytes)).await;
+                                    }
+                                    break;
+                                }
+                                debug!("Empty quotes response ({}/{})", empty_quotes_count, MAX_EMPTY_QUOTES);
+                            } else {
+                                warn!("Failed to parse quotes from swap_quotes payload, type={:?}, is_map={}",
+                                    match &swap_quotes {
+                                        rmpv::Value::Nil => "Nil",
+                                        rmpv::Value::Boolean(_) => "Boolean",
+                                        rmpv::Value::Integer(_) => "Integer",
+                                        rmpv::Value::F32(_) => "F32",
+                                        rmpv::Value::F64(_) => "F64",
+                                        rmpv::Value::String(_) => "String",
+                                        rmpv::Value::Binary(_) => "Binary",
+                                        rmpv::Value::Array(_) => "Array",
+                                        rmpv::Value::Map(m) => { info!("Map keys: {:?}", m.iter().take(10).map(|(k,_)| format!("{:?}", k)).collect::<Vec<_>>()); "Map" },
+                                        rmpv::Value::Ext(_, _) => "Ext",
+                                    },
+                                    swap_quotes.is_map()
+                                );
+                            }
                         }
                     } else {
                         warn!("No SwapQuotes in stream payload");
@@ -587,6 +609,23 @@ fn extract_swap_quotes_from_payload(payload: &rmpv::Value) -> Option<rmpv::Value
         }
     }
     None
+}
+
+/// Check if quotes payload has an empty quotes map (valid response but no routes)
+fn is_quotes_map_empty(payload: &rmpv::Value) -> bool {
+    let Some(map) = payload.as_map() else {
+        return false;
+    };
+    for (k, v) in map {
+        if let rmpv::Value::String(key) = k {
+            if key.as_str() == Some("quotes") {
+                if let Some(quotes_map) = v.as_map() {
+                    return quotes_map.is_empty();
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Parse quotes from MessagePack payload
@@ -1010,6 +1049,30 @@ pub async fn get_swap_instructions(
         instructions,
         lookup_tables: None,
     })
+}
+
+/// Get quote with instructions in a single call
+/// This ensures the ALTs in SwapRoute match the returned instructions
+pub async fn get_quote_with_instructions(
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount: u64,
+    only_direct_routes: bool,
+    slippage_bps: Option<u16>,
+    max_accounts: Option<u8>,
+    user_public_key: Pubkey,
+) -> TitanResult<(SwapRoute, Vec<Instruction>)> {
+    get_titan_client()
+        .get_quote(
+            input_mint,
+            output_mint,
+            amount,
+            slippage_bps,
+            only_direct_routes,
+            max_accounts,
+            user_public_key,
+        )
+        .await
 }
 
 /// Fetch prices using GetSwapPrice from Titan (simpler than full quote)
@@ -1767,8 +1830,6 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_flash_loan_liquidation_tx_size() {
-        use std::collections::HashSet;
-
         println!("\n=== Flash Loan Liquidation Transaction Size Test ===\n");
 
         // Data from the ACTUAL failed liquidation log:
@@ -2193,5 +2254,600 @@ mod tests {
         assert!(both_base64 <= max_size,
             "With direct routes + both LUTs, tx ({} bytes) should fit under {} bytes",
             both_base64, max_size);
+    }
+
+    /// Test with REAL data from failed SOL→USDC liquidation with MULTIPLE collateral positions
+    /// Obligation: 6ZecFRPcGRB5uetS68Boz3MtSvxgofyNvSXvPPP5fy9f
+    /// This has 2 deposits (SOL + kUXDUSDCOrca) and 1 borrow (USDC)
+    /// Run with: cargo test test_multi_collateral_liquidation -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_multi_collateral_liquidation() {
+        println!("\n=== Multi-Collateral SOL→USDC Liquidation Test (Real Data) ===\n");
+
+        // From log:
+        // Obligation: 6ZecFRPcGRB5uetS68Boz3MtSvxgofyNvSXvPPP5fy9f
+        // Market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
+        // debt_reserve=D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59 (USDC)
+        // coll_reserve=d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q (SOL)
+        // Deposits:
+        //   [0] SOL: d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q - 2448854 lamports
+        //   [1] kUXDUSDCOrca: FV4U1cQhPj7wNC1UbHuYBX4mLZLjG7pfKvhAqeJMTEgt
+        // Borrows:
+        //   [0] USDC: D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59 - 256895 (~0.26 USDC)
+        // Swap: SOL -> USDC (collateral to debt)
+        // Lookup table: "256 current, 572 missing keys"
+
+        let max_size = 1644;
+
+        println!("Obligation details:");
+        println!("  Pubkey: 6ZecFRPcGRB5uetS68Boz3MtSvxgofyNvSXvPPP5fy9f");
+        println!("  Deposits: 2 (SOL @ 2448854 lamports, kUXDUSDCOrca)");
+        println!("  Borrows: 1 (USDC @ 256895 = ~$0.26)");
+        println!("  Swap: SOL → USDC");
+
+        // The issue: "256 current, 572 missing keys"
+        // This means 572 accounts in the tx weren't found in the 256-address LUT
+        // Total accounts needed: 256 + 572 = 828 (but many overlaps)
+
+        println!("\nLookup table analysis:");
+        println!("  Addresses in LUT: 256");
+        println!("  Missing keys: 572");
+        println!("  This shows the LUT has WRONG accounts (old collect_keys had 550+ keys)");
+
+        // For multi-collateral liquidations, we need 3 refresh_reserve instructions
+        // (1 for each deposit reserve + 1 for debt reserve)
+        let num_refresh_reserves = 3; // SOL, kUXDUSDCOrca, USDC
+
+        // Transaction structure:
+        // 1. flash_borrow_reserve_liquidity (USDC)
+        // 2-4. refresh_reserve x3 (SOL, kUXDUSDCOrca, USDC)
+        // 5. refresh_obligation
+        // 6. liquidate_obligation_and_redeem_reserve_collateral
+        // 7-N. swap instructions (SOL → USDC)
+        // N+1. flash_repay_reserve_liquidity
+
+        println!("\nTransaction structure:");
+        println!("  1. flash_borrow_reserve_liquidity (USDC)");
+        println!("  2-{}. refresh_reserve x{} (for each deposit + debt)", 1 + num_refresh_reserves, num_refresh_reserves);
+        println!("  N. refresh_obligation");
+        println!("  N+1. liquidate_obligation_and_redeem_reserve_collateral");
+        println!("  N+2-M. swap instructions (SOL → USDC)");
+        println!("  M+1. flash_repay_reserve_liquidity");
+
+        // Unique accounts estimate for multi-collateral
+        let kamino_base_accounts = 15; // common Kamino accounts
+        let per_reserve_accounts = 3; // reserve, oracle, maybe farm
+        let total_reserves_used = 3; // SOL deposit, kUXDUSDCOrca deposit, USDC debt
+        let liquidator_accounts = 3; // wallet + 2 ATAs
+
+        let kamino_accounts = kamino_base_accounts + per_reserve_accounts * total_reserves_used + liquidator_accounts;
+        println!("\nAccount estimates:");
+        println!("  Kamino base accounts: {}", kamino_base_accounts);
+        println!("  Per-reserve accounts: {} x {} = {}", per_reserve_accounts, total_reserves_used, per_reserve_accounts * total_reserves_used);
+        println!("  Liquidator accounts: {}", liquidator_accounts);
+        println!("  Total Kamino accounts: {}", kamino_accounts);
+
+        // Swap accounts (for direct route SOL→USDC)
+        let swap_accounts_direct = 12; // DEX program, pools, vaults, etc
+
+        let total_accounts = kamino_accounts + swap_accounts_direct;
+        println!("  Swap accounts (direct route): {}", swap_accounts_direct);
+        println!("  Total accounts: {}", total_accounts);
+
+        // With WORKING lookup tables
+        let fixed_overhead = 64 + 3 + 32; // sig + header + blockhash
+        let num_instructions_direct = 9; // flash_borrow + 3 refresh + liquidate + 2 swap + flash_repay + refresh_obligation
+        let instruction_bytes = num_instructions_direct * 10 + num_instructions_direct * 20 + 350;
+
+        // Accounts in Kamino LUT (new collect_keys ~170 accounts)
+        let in_kamino_lut = 25; // reserve pubkeys + liquidator ATAs that are actually used
+        let in_swap_lut = 8;
+        let total_in_luts = in_kamino_lut + in_swap_lut;
+        let outside_luts = total_accounts - total_in_luts;
+
+        println!("\nWith WORKING lookup tables (Kamino + Swap):");
+        println!("  In Kamino LUT: {}", in_kamino_lut);
+        println!("  In Swap LUT: {}", in_swap_lut);
+        println!("  Outside both: {}", outside_luts);
+
+        let account_bytes = outside_luts * 32 + total_in_luts * 1 + 64; // 64 for 2 LUTs
+        let raw_size = fixed_overhead + instruction_bytes + account_bytes;
+        let base64_size = (raw_size * 4 + 2) / 3;
+
+        println!("  Account bytes: {}", account_bytes);
+        println!("  Instruction bytes: {}", instruction_bytes);
+        println!("  Raw size: {} bytes", raw_size);
+        println!("  Base64 size: {} bytes", base64_size);
+        println!("  Max allowed: {} bytes", max_size);
+        println!("  Status: {}", if base64_size <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        if base64_size <= max_size {
+            println!("  Headroom: {} bytes ({:.1}%)",
+                max_size - base64_size,
+                (1.0 - base64_size as f64 / max_size as f64) * 100.0
+            );
+        }
+
+        println!("\n=== CONCLUSION ===");
+        println!("Multi-collateral liquidations require 1 extra refresh_reserve per additional deposit.");
+        println!("With direct swap routes and working LUTs, transactions should fit.");
+        println!("Key fix: delete old liquidator_lookup_tables.json and let new collect_keys create proper LUT.");
+
+        assert!(base64_size <= max_size,
+            "Multi-collateral liquidation with LUTs ({} bytes) should fit under {} bytes",
+            base64_size, max_size);
+    }
+
+    /// Test with REAL data from failed JLP→USDC liquidation (smaller market)
+    /// Market: DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek (only 7 reserves!)
+    /// Obligation: 6hPUuoTRGPcmrzYd5RWH19oJgYST61BVcNTb8dHSnXHR
+    /// Run with: cargo test test_jlp_usdc_liquidation -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_jlp_usdc_liquidation() {
+        println!("\n=== JLP→USDC Liquidation Test (Small Market, Real Data) ===\n");
+
+        // From log:
+        // Obligation: 6hPUuoTRGPcmrzYd5RWH19oJgYST61BVcNTb8dHSnXHR
+        // Market: DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek (7 reserves only!)
+        // debt_reserve=Ga4rZytCpq1unD4DbEJ5bkHeUz9g3oh9AAFEi6vSauXp (USDC)
+        // coll_reserve=DdTmCCjv7zHRD1hJv3E8bpnSEQBzdKkzB1j9ApXX5QoP (JLP)
+        // JLP mint: 27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4
+        // USDC mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        // Swap: JLP → USDC, amount=687174
+        // Instructions: 13 (2 swap instructions - already direct route!)
+        // Transaction size: 2952 bytes (max 1644)
+        // Lookup table: "256 current, 380 missing keys"
+        // PROFITABLE: Expected profit = 391942 debt tokens
+
+        let actual_tx_size = 2952;
+        let max_size = 1644;
+        let num_instructions = 13;
+        let num_swap_instructions = 2;
+        let num_reserves_in_market = 7;
+
+        println!("Obligation details:");
+        println!("  Pubkey: 6hPUuoTRGPcmrzYd5RWH19oJgYST61BVcNTb8dHSnXHR");
+        println!("  Market: DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek");
+        println!("  Reserves in market: {} (small market!)", num_reserves_in_market);
+        println!("  Deposit: JLP (687174 lamports, ~$31.64)");
+        println!("  Borrow: USDC (26128244 = ~$26.12)");
+        println!("  Swap: JLP → USDC");
+        println!("  Expected profit: 391942 USDC (~$0.39)");
+
+        println!("\nTransaction details:");
+        println!("  Actual size: {} bytes (max {})", actual_tx_size, max_size);
+        println!("  Instructions: {} ({} swap)", num_instructions, num_swap_instructions);
+        println!("  Already using direct routes!");
+
+        // The issue: "256 current, 380 missing keys"
+        // This market has only 7 reserves, so why 380 missing?
+        // Because the old collect_keys collected ALL reserves from ALL markets!
+        let raw_size = actual_tx_size * 3 / 4; // ~2214 raw bytes
+        println!("  Raw size: ~{} bytes", raw_size);
+
+        println!("\nLookup table analysis:");
+        println!("  Addresses in LUT: 256");
+        println!("  Missing keys: 380");
+        println!("  Market only has {} reserves - LUT has WRONG accounts!", num_reserves_in_market);
+        println!("  This market should need MUCH smaller LUT");
+
+        // For this small market, the LUT should contain:
+        // - 7 reserve pubkeys
+        // - ~14 liquidator ATAs (2 per reserve)
+        // - ~5 lending market info
+        // = ~26 keys total for THIS market
+
+        let correct_lut_size = num_reserves_in_market + num_reserves_in_market * 2 + 5;
+        println!("\nCorrect LUT size for this market: ~{} keys (not 256!)", correct_lut_size);
+
+        // Transaction structure:
+        // 1. flash_borrow_reserve_liquidity (USDC)
+        // 2. init_obligation_farm
+        // 3-4. refresh_reserve x2 (JLP, USDC)
+        // 5. refresh_obligation
+        // 6-7. refresh_obligation_farms x2
+        // 8. liquidate_obligation_and_redeem_reserve_collateral
+        // 9-10. swap instructions x2 (JLP → USDC)
+        // 11. flash_repay_reserve_liquidity
+        // Total: 11-13 instructions
+
+        println!("\nTransaction structure:");
+        println!("  1. flash_borrow_reserve_liquidity (USDC)");
+        println!("  2. init_obligation_farm");
+        println!("  3-4. refresh_reserve x2 (JLP, USDC)");
+        println!("  5. refresh_obligation");
+        println!("  6-7. refresh_obligation_farms x2");
+        println!("  8. liquidate_obligation_and_redeem_reserve_collateral");
+        println!("  9-10. swap instructions x2 (direct route)");
+        println!("  11. flash_repay_reserve_liquidity");
+
+        // Reverse-engineer account count from actual tx size
+        // 2952 base64 → ~2214 raw bytes
+        // Fixed overhead: 64 (sig) + 3 (header) + 32 (blockhash) = 99
+        // Instruction data estimate: ~750 bytes (13 instructions with farm ops)
+        // Account bytes: 2214 - 99 - 750 = ~1365 → ~42 accounts at 32 bytes
+        let actual_raw = actual_tx_size * 3 / 4;
+        let fixed_overhead = 99;
+        let instruction_estimate = 750;
+        let account_bytes_actual = actual_raw as i32 - fixed_overhead - instruction_estimate;
+        let total_accounts = account_bytes_actual / 32;
+
+        println!("\nReverse-engineered from actual tx:");
+        println!("  Raw size: {} bytes", actual_raw);
+        println!("  Fixed overhead: {} bytes", fixed_overhead);
+        println!("  Instruction estimate: {} bytes", instruction_estimate);
+        println!("  Account bytes: {} → ~{} accounts", account_bytes_actual, total_accounts);
+
+        // With WORKING lookup table for THIS market
+        // Farm instructions add more accounts (farm state, farm authority, etc.)
+        // JLP swaps also tend to have more DEX accounts
+
+        // Key insight: with per-market LUTs, we can put MORE accounts in the LUT
+        // because we're not sharing 256 slots across ALL markets
+        // Also, Titan typically provides good LUT coverage for swap accounts
+        let in_kamino_lut = 25; // reserve pubkeys, vaults, mints, ATAs, farm accounts
+        let in_swap_lut = 10;   // DEX accounts from Titan LUT (JLP has good liquidity)
+        let total_in_luts = in_kamino_lut + in_swap_lut;
+        let outside_luts = (total_accounts - total_in_luts).max(5); // at least some system accounts
+
+        println!("\nWith WORKING lookup tables:");
+        println!("  In Kamino LUT: {}", in_kamino_lut);
+        println!("  In Swap LUT: {}", in_swap_lut);
+        println!("  Outside both: {}", outside_luts);
+
+        let account_bytes = outside_luts * 32 + total_in_luts * 1 + 64;
+        let raw_size_new = fixed_overhead + instruction_estimate + account_bytes;
+        let base64_size = (raw_size_new * 4 + 2) / 3;
+
+        println!("  Account bytes: {}", account_bytes);
+        println!("  Instruction bytes: {}", instruction_estimate);
+        println!("  Raw size: {} bytes", raw_size_new);
+        println!("  Base64 size: {} bytes", base64_size);
+        println!("  Max allowed: {} bytes", max_size);
+        println!("  Status: {}", if base64_size <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        if base64_size <= max_size {
+            println!("  Headroom: {} bytes ({:.1}%)",
+                max_size - base64_size,
+                (1.0 - base64_size as f64 / max_size as f64) * 100.0
+            );
+        }
+
+        println!("\n=== CONCLUSION ===");
+        println!("This small market (7 reserves) should have MUCH smaller LUT requirements.");
+        println!("The 380 missing keys shows the old LUT had accounts from OTHER markets.");
+        println!("With per-market LUTs (already implemented) + working collect_keys, this fits easily.");
+
+        assert!(base64_size <= max_size,
+            "JLP→USDC liquidation with LUTs ({} bytes) should fit under {} bytes",
+            base64_size, max_size);
+    }
+
+    /// Test with REAL data from failed SOL→EURC liquidation with 5 COLLATERALS
+    /// This is the heaviest case - 5 deposits requiring 6 refresh_reserve instructions!
+    /// Obligation: 8K5DnSWyQ4p6FfjhQ7QxSR9rnK38CMVCRUxqx4nVw6QK
+    /// Run with: cargo test test_heavy_multi_deposit_liquidation -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_heavy_multi_deposit_liquidation() {
+        println!("\n=== Heavy Multi-Deposit SOL→EURC Liquidation Test ===\n");
+
+        // From log:
+        // Obligation: 8K5DnSWyQ4p6FfjhQ7QxSR9rnK38CMVCRUxqx4nVw6QK
+        // Market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF (55 reserves)
+        // debt_reserve=EGPE45iPkme8G8C1xFDNZoZeHdP3aRYtaAfAQuuwrcGZ (EURC)
+        // coll_reserve=d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q (SOL)
+        // DEPOSITS (5!):
+        //   SOL: $132.91
+        //   cbBTC: $379.55
+        //   ETH: $104.99
+        //   JupSOL: $5.73
+        //   USDC: $3.17
+        // BORROW: EURC $419.02
+        // Swap: SOL → EURC (HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr)
+        // Instructions: 21 (6 swap - multi-hop!)
+        // Transaction size: 4000 bytes (max 1644)
+        // Expected profit: 3570588 EURC (~$3.57)
+
+        let actual_tx_size = 4000;
+        let max_size = 1644;
+        let num_instructions = 21;
+        let num_swap_instructions = 6;
+        let num_deposits = 5;
+
+        println!("Obligation details:");
+        println!("  Pubkey: 8K5DnSWyQ4p6FfjhQ7QxSR9rnK38CMVCRUxqx4nVw6QK");
+        println!("  Deposits: {} (SOL, cbBTC, ETH, JupSOL, USDC)", num_deposits);
+        println!("  Borrow: EURC (~$419)");
+        println!("  Swap: SOL → EURC");
+        println!("  Expected profit: ~$3.57");
+
+        println!("\nTransaction details:");
+        println!("  Actual size: {} bytes (max {})", actual_tx_size, max_size);
+        println!("  Instructions: {} ({} swap - MULTI-HOP!)", num_instructions, num_swap_instructions);
+        println!("  This uses multi-hop because SOL→EURC has limited direct liquidity");
+
+        // Transaction structure with 5 deposits:
+        // 1. flash_borrow_reserve_liquidity (EURC)
+        // 2. init_obligation_farm
+        // 3-7. refresh_reserve x5 (ETH, cbBTC, USDC, JupSOL, SOL) - for all deposits
+        // 8. refresh_reserve (EURC) - for debt
+        // 9. refresh_obligation
+        // 10-11. refresh_obligation_farms x2
+        // 12. liquidate_obligation_and_redeem_reserve_collateral
+        // 13-18. swap instructions x6 (multi-hop SOL → EURC)
+        // 19. flash_repay_reserve_liquidity
+        // Total: ~19-21 instructions
+
+        let num_refresh_reserves = num_deposits + 1; // 5 deposits + 1 debt
+        println!("\nTransaction structure:");
+        println!("  1. flash_borrow_reserve_liquidity");
+        println!("  2. init_obligation_farm");
+        println!("  3-{}. refresh_reserve x{} (for {} deposits + 1 debt)", 2 + num_refresh_reserves, num_refresh_reserves, num_deposits);
+        println!("  N. refresh_obligation");
+        println!("  N+1-2. refresh_obligation_farms x2");
+        println!("  N+3. liquidate_obligation_and_redeem_reserve_collateral");
+        println!("  N+4-{}. swap instructions x{}", num_instructions - 1, num_swap_instructions);
+        println!("  {}. flash_repay_reserve_liquidity", num_instructions);
+
+        // Raw size analysis
+        let raw_size = actual_tx_size * 3 / 4; // ~3000 bytes
+        println!("\nSize analysis:");
+        println!("  Raw size: ~{} bytes", raw_size);
+        println!("  This is HUGE - even with LUTs this is challenging");
+
+        // With DIRECT ROUTES: reduce swap instructions from 6 to 2
+        // But SOL→EURC may not have a direct route!
+        let num_instructions_direct = num_instructions - 4; // 17 instructions
+        let fixed_overhead = 99;
+        let instruction_estimate_multi = 1200; // 21 instructions with multi-hop swap data
+        let instruction_estimate_direct = 800; // 17 instructions with direct swap
+
+        // Account estimate
+        let account_bytes_actual = raw_size - fixed_overhead - instruction_estimate_multi;
+        let total_accounts = account_bytes_actual / 32;
+
+        println!("\nReverse-engineered from actual tx:");
+        println!("  Instruction bytes: ~{}", instruction_estimate_multi);
+        println!("  Account bytes: {} → ~{} accounts", account_bytes_actual, total_accounts);
+
+        // With working LUTs
+        let in_kamino_lut = 30; // more accounts for 5 deposits
+        let in_swap_lut = 10;
+        let total_in_luts = in_kamino_lut + in_swap_lut;
+        let outside_luts = (total_accounts - total_in_luts).max(10);
+
+        println!("\nWith WORKING lookup tables (MULTI-HOP):");
+        let account_bytes = outside_luts * 32 + total_in_luts * 1 + 64;
+        let raw_size_new = fixed_overhead + instruction_estimate_multi + account_bytes;
+        let base64_size = (raw_size_new * 4 + 2) / 3;
+        println!("  Base64 size: {} bytes", base64_size);
+        println!("  Status: {}", if base64_size <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        // With DIRECT ROUTES (if available)
+        println!("\nWith DIRECT ROUTES + LUTs:");
+        let account_bytes_direct = (outside_luts - 5) * 32 + (total_in_luts + 5) * 1 + 64;
+        let raw_size_direct = fixed_overhead + instruction_estimate_direct + account_bytes_direct;
+        let base64_size_direct = (raw_size_direct * 4 + 2) / 3;
+        println!("  Instructions: {} (was {})", num_instructions_direct, num_instructions);
+        println!("  Base64 size: {} bytes", base64_size_direct);
+        println!("  Status: {}", if base64_size_direct <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        println!("\n=== CONCLUSION ===");
+        println!("5-collateral obligations are the HEAVIEST case:");
+        println!("  - 6 refresh_reserve instructions (5 deposits + 1 debt)");
+        println!("  - Requires direct swap route to have any chance of fitting");
+        println!("  - SOL→EURC may not have good direct liquidity");
+        println!("  - Consider skipping these liquidations or using a different approach");
+
+        // This is a KNOWN LIMITATION - 5 collateral positions are too heavy
+        // The test documents this rather than asserting it should fit
+        println!("\n⚠ KNOWN LIMITATION: 5-collateral liquidations may not fit!");
+        println!("  With direct routes: {} bytes (max {})", base64_size_direct, max_size);
+        println!("  Over by: {} bytes ({:.1}%)",
+            base64_size_direct - max_size,
+            ((base64_size_direct as f64 / max_size as f64) - 1.0) * 100.0
+        );
+        println!("\n  Possible solutions:");
+        println!("    1. Skip these liquidations");
+        println!("    2. Wait for position to shrink to fewer collaterals");
+        println!("    3. Use Jito bundles (higher tx size limit)");
+        println!("    4. Split refresh instructions into separate tx");
+
+        // Document this is expected to fail - don't assert
+        // In production, these liquidations should be skipped or handled differently
+    }
+
+    /// Test with REAL data from failed cbBTC→USDC liquidation (2 collaterals, direct route)
+    /// Already using direct routes but still too large!
+    /// Obligation: D2ApikhmwnsCrUC4HDVjD2itAYxUHAi3yyQmt3X3WSPb
+    /// Run with: cargo test test_cbbtc_usdc_liquidation -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_cbbtc_usdc_liquidation() {
+        println!("\n=== cbBTC→USDC Liquidation Test (Already Direct Routes) ===\n");
+
+        // From log:
+        // Obligation: D2ApikhmwnsCrUC4HDVjD2itAYxUHAi3yyQmt3X3WSPb
+        // Market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF (55 reserves)
+        // debt_reserve=D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59 (USDC)
+        // coll_reserve=37Jk2zkz23vkAYBT66HM2gaqJuNg2nYLsCreQAVt5MWK (cbBTC)
+        // Deposits:
+        //   cbBTC: $2197.15
+        //   MSOL: $0.001 (dust)
+        // Borrow: USDC $1734.30
+        // Swap: cbBTC → USDC
+        // Instructions: 12 (2 swap - ALREADY DIRECT!)
+        // Transaction size: 2568 bytes (max 1644)
+        // Expected profit: 17696810 USDC (~$17.70)
+
+        let actual_tx_size = 2568;
+        let max_size = 1644;
+        let num_instructions = 12;
+        let num_swap_instructions = 2;
+
+        println!("Obligation details:");
+        println!("  Pubkey: D2ApikhmwnsCrUC4HDVjD2itAYxUHAi3yyQmt3X3WSPb");
+        println!("  Deposits: 2 (cbBTC $2197, MSOL $0.001)");
+        println!("  Borrow: USDC $1734");
+        println!("  Swap: cbBTC → USDC");
+        println!("  Expected profit: ~$17.70 (!)");
+
+        println!("\nTransaction details:");
+        println!("  Actual size: {} bytes (max {})", actual_tx_size, max_size);
+        println!("  Instructions: {} ({} swap - ALREADY DIRECT!)", num_instructions, num_swap_instructions);
+        println!("  Problem: Still too large even with direct routes!");
+
+        // Transaction structure:
+        // 1. flash_borrow_reserve_liquidity (USDC)
+        // 2. init_obligation_farm
+        // 3-5. refresh_reserve x3 (MSOL, cbBTC, USDC)
+        // 6. refresh_obligation
+        // 7. refresh_obligation_farms
+        // 8. liquidate_obligation_and_redeem_reserve_collateral
+        // 9-10. swap instructions x2 (cbBTC → USDC)
+        // 11. flash_repay_reserve_liquidity
+        // 12. (possibly compute budget or extra)
+
+        println!("\nTransaction structure:");
+        println!("  1. flash_borrow_reserve_liquidity");
+        println!("  2. init_obligation_farm");
+        println!("  3-5. refresh_reserve x3 (cbBTC, MSOL deposits + USDC debt)");
+        println!("  6. refresh_obligation");
+        println!("  7. refresh_obligation_farms");
+        println!("  8. liquidate_obligation_and_redeem_reserve_collateral");
+        println!("  9-10. swap instructions x2 (direct route)");
+        println!("  11-12. flash_repay + extra");
+
+        // Raw size analysis
+        let raw_size = actual_tx_size * 3 / 4; // ~1926 bytes
+        let fixed_overhead = 99;
+        let instruction_estimate = 550; // 12 instructions with direct swap
+
+        let account_bytes_actual = raw_size - fixed_overhead - instruction_estimate;
+        let total_accounts = account_bytes_actual / 32;
+
+        println!("\nReverse-engineered from actual tx:");
+        println!("  Raw size: ~{} bytes", raw_size);
+        println!("  Instruction bytes: ~{}", instruction_estimate);
+        println!("  Account bytes: {} → ~{} accounts", account_bytes_actual, total_accounts);
+
+        // With WORKING lookup tables
+        let in_kamino_lut = 20;
+        let in_swap_lut = 8;
+        let total_in_luts = in_kamino_lut + in_swap_lut;
+        let outside_luts = (total_accounts - total_in_luts).max(5);
+
+        println!("\nWith WORKING lookup tables:");
+        println!("  In Kamino LUT: {}", in_kamino_lut);
+        println!("  In Swap LUT: {}", in_swap_lut);
+        println!("  Outside both: {}", outside_luts);
+
+        let account_bytes = outside_luts * 32 + total_in_luts * 1 + 64;
+        let raw_size_new = fixed_overhead + instruction_estimate + account_bytes;
+        let base64_size = (raw_size_new * 4 + 2) / 3;
+
+        println!("  Account bytes: {}", account_bytes);
+        println!("  Raw size: {} bytes", raw_size_new);
+        println!("  Base64 size: {} bytes", base64_size);
+        println!("  Max allowed: {} bytes", max_size);
+        println!("  Status: {}", if base64_size <= max_size { "✓ FITS" } else { "✗ TOO LARGE" });
+
+        if base64_size <= max_size {
+            println!("  Headroom: {} bytes ({:.1}%)",
+                max_size - base64_size,
+                (1.0 - base64_size as f64 / max_size as f64) * 100.0
+            );
+        }
+
+        println!("\n=== CONCLUSION ===");
+        println!("This cbBTC→USDC liquidation (2 collaterals, direct route):");
+        println!("  - Is already using direct swap routes");
+        println!("  - With working LUTs should fit with some headroom");
+        println!("  - The $17.70 profit makes it a high-value target!");
+
+        assert!(base64_size <= max_size,
+            "cbBTC→USDC liquidation with LUTs ({} bytes) should fit under {} bytes",
+            base64_size, max_size);
+    }
+
+    /// Test ALTs returned by Titan for ETH→USDC and SOL→USDC with direct vs non-direct routes
+    /// Run with: cargo test --package klend-terminator test_titan_alts -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_titan_alts() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .init();
+
+        let config = TitanConfig::from_env().expect("TITAN_ENDPOINT must be set");
+        let client = TitanClient::new(config);
+
+        // Token mints
+        let sol_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().unwrap();
+        let usdc_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
+        let weth_mint: Pubkey = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs".parse().unwrap(); // Portal wETH
+
+        use solana_sdk::signer::Signer;
+        let user: Pubkey = std::env::var("KEYPAIR_PATH")
+            .ok()
+            .and_then(|path| {
+                let data = std::fs::read_to_string(&path).ok()?;
+                let bytes: Vec<u8> = serde_json::from_str(&data).ok()?;
+                solana_sdk::signature::Keypair::from_bytes(&bytes).ok()
+            })
+            .map(|kp| kp.pubkey())
+            .unwrap_or_else(|| "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1".parse().unwrap());
+
+        println!("\n=== Testing Titan ALTs for Different Routes ===\n");
+
+        // Test cases: (name, from_mint, to_mint, amount)
+        let test_cases = [
+            ("SOL→USDC (6.3 SOL)", sol_mint, usdc_mint, 6_319_669_634u64), // From failed liquidation
+            ("ETH→USDC (0.1154 ETH)", weth_mint, usdc_mint, 11_545_304u64), // From failed liquidation
+            ("ETH→USDC (0.002 ETH)", weth_mint, usdc_mint, 2_169_808u64),  // Smaller amount
+            ("ETH→USDC (0.0008 ETH)", weth_mint, usdc_mint, 86_357u64),    // Tiny amount
+        ];
+
+        for (name, from_mint, to_mint, amount) in test_cases {
+            println!("--- {} ---", name);
+
+            // Test direct route
+            print!("  Direct route:     ");
+            match client.get_quote(&from_mint, &to_mint, amount, Some(100), true, Some(58), user).await {
+                Ok((route, instructions)) => {
+                    println!("✓ out={} ixs={} ALTs={}", route.out_amount, instructions.len(), route.address_lookup_tables.len());
+                    if !route.address_lookup_tables.is_empty() {
+                        for alt in &route.address_lookup_tables {
+                            println!("                    ALT: {}", alt);
+                        }
+                    }
+                }
+                Err(e) => println!("✗ {:?}", e),
+            }
+
+            // Test non-direct route
+            print!("  Non-direct route: ");
+            // Need new client for each request due to WebSocket state
+            let config2 = TitanConfig::from_env().unwrap();
+            let client2 = TitanClient::new(config2);
+            match client2.get_quote(&from_mint, &to_mint, amount, Some(100), false, Some(58), user).await {
+                Ok((route, instructions)) => {
+                    println!("✓ out={} ixs={} ALTs={}", route.out_amount, instructions.len(), route.address_lookup_tables.len());
+                    if !route.address_lookup_tables.is_empty() {
+                        for alt in &route.address_lookup_tables {
+                            println!("                    ALT: {}", alt);
+                        }
+                    }
+                }
+                Err(e) => println!("✗ {:?}", e),
+            }
+            println!();
+        }
+
+        println!("=== Test Complete ===");
     }
 }

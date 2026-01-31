@@ -1,12 +1,13 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anchor_client::{solana_sdk::pubkey::Pubkey, Cluster};
+use base64::engine::{general_purpose::STANDARD as BS64, Engine};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use consts::WRAPPED_SOL_MINT;
 use itertools::Itertools;
-use crate::titan::DecompiledVersionedTx;
+use crate::routing::DecompiledVersionedTx;
 use bytemuck::try_from_bytes;
 use kamino_lending::{Obligation, Reserve};
 use solana_sdk::{
@@ -45,11 +46,12 @@ pub mod liquidator;
 pub mod lookup_tables;
 pub mod macros;
 pub mod math;
+pub mod metis;
 mod model;
 pub mod operations;
 mod px;
 pub mod sysvars;
-pub mod titan;
+pub mod titan;  // Keep for now, will remove after Metis is confirmed working
 mod utils;
 
 const USDC_MINT_STR: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -148,6 +150,11 @@ pub enum Actions {
     CrankStream {
         #[clap(flatten)]
         rebalance_args: RebalanceArgs,
+
+        /// How often to refresh market state (hours). Default: 4 hours.
+        /// This is a fallback safety check; Geyser provides real-time updates.
+        #[clap(long, env = "STATE_REFRESH_HOURS", default_value = "4")]
+        state_refresh_hours: u64,
     },
     #[clap()]
     Liquidate {
@@ -217,14 +224,14 @@ async fn main() -> Result<()> {
             obligation: obligation_filter,
             rebalance_args: _,
         } => crank(&klend_client, obligation_filter).await,
-        Actions::CrankStream { rebalance_args: _ } => {
+        Actions::CrankStream { rebalance_args: _, state_refresh_hours } => {
             let geyser_endpoint = args
                 .geyser_endpoint
                 .ok_or_else(|| anyhow::anyhow!("--geyser-endpoint is required for CrankStream"))?;
             let geyser_api_key = args
                 .geyser_api_key
                 .ok_or_else(|| anyhow::anyhow!("--geyser-api-key is required for CrankStream"))?;
-            crank_stream(&klend_client, geyser_endpoint, geyser_api_key).await
+            crank_stream(&klend_client, geyser_endpoint, geyser_api_key, state_refresh_hours).await
         }
         Actions::Liquidate {
             obligation,
@@ -563,11 +570,8 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
     let coll_reserve = StateWithKey::new(coll_reserve_state, coll_res_key);
     let lending_market = StateWithKey::new(*market, ob.lending_market);
     let obligation = StateWithKey::new(ob, *obligation);
-    let pxs = fetch_prices(&[debt_mint, WRAPPED_SOL_MINT], &rebalance_config.usdc_mint, 100.0).await?;
-    let holdings = klend_client
-        .liquidator
-        .fetch_holdings(&klend_client.client.client, &reserves, &pxs)
-        .await?;
+    // Skip slow price fetch - holdings aren't used in decide_liquidation_strategy for flash loans
+    let holdings = Holdings::default();
 
     let deposit_reserves: Vec<StateWithKey<Reserve>> = ob
         .deposits
@@ -785,10 +789,19 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             total_luts += 1;
         }
 
-        // Check transaction size before proceeding
-        let txn_b64 = txn.to_base64();
-        let txn_size = txn_b64.len();
-        const MAX_TX_SIZE: usize = 1644; // Max base64 encoded size
+        // Build the versioned transaction with lookup tables first
+        let txn = match txn.build_with_budget_and_fee(&[]).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to build transaction: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        // Check transaction size using the actual serialized versioned transaction
+        let txn_bytes = bincode::serialize(&txn).unwrap_or_default();
+        let txn_size = txn_bytes.len();
+        const MAX_TX_SIZE: usize = 1232; // Solana raw transaction limit
 
         if txn_size > MAX_TX_SIZE {
             warn!(
@@ -810,18 +823,11 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             txn_size,
             (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
         );
+        let txn_b64 = BS64.encode(&txn_bytes);
         println!(
             "Simulation: https://explorer.solana.com/tx/inspector?message={}",
             urlencoding::encode(&txn_b64)
         );
-
-        let txn = match txn.build_with_budget_and_fee(&[]).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Failed to build transaction: {:?}", e);
-                return Ok(());
-            }
-        };
 
         let res = match klend_client
             .client
@@ -837,6 +843,403 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         };
 
         // Check simulation result for errors
+        if let Some(err) = res.value.err {
+            warn!("Simulation returned error: {:?}", err);
+            if let Some(logs) = &res.value.logs {
+                for log in logs.iter().rev().take(5) {
+                    warn!("  Log: {}", log);
+                }
+            }
+            return Ok(());
+        }
+
+        info!("Simulation succeeded, units consumed: {:?}", res.value.units_consumed);
+
+        let should_send = true;
+
+        if should_send {
+            match klend_client
+                .client
+                .send_retry_and_confirm_transaction(txn, None, false)
+                .await
+            {
+                Ok(sig) => {
+                    info!("Liquidation tx sent: {:?}", sig.0);
+                    info!("Liquidation tx res: {:?}", sig.1);
+                }
+                Err(e) => {
+                    warn!("Liquidation tx failed: {:?}", e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fast liquidation path for streaming mode - uses cached data to minimize RPC calls
+/// Saves ~250ms by avoiding redundant fetches of obligation, reserves, referrer_token_states
+async fn liquidate_fast(
+    klend_client: &KlendClient,
+    obligation_pubkey: &Pubkey,
+    obligation: Obligation,
+    market_state: &MarketState,
+    slot: u64,
+) -> Result<()> {
+    info!("Liquidating obligation {} (fast path)", obligation_pubkey.to_string().green());
+    let rebalance_config = match &klend_client.rebalance_config {
+        None => return Err(anyhow::anyhow!("Rebalance settings not found")),
+        Some(c) => c,
+    };
+
+    // Start with cached reserves
+    let mut ob = obligation;
+    let mut reserves = market_state.reserves.clone();
+    let market = &market_state.lending_market;
+    let rts = &market_state.referrer_token_states;
+
+    // Collect reserve keys referenced by this obligation (deposits + borrows)
+    let mut obligation_reserve_keys: Vec<Pubkey> = Vec::new();
+    for deposit in ob.deposits.iter() {
+        if deposit.deposit_reserve != Pubkey::default() && !obligation_reserve_keys.contains(&deposit.deposit_reserve) {
+            obligation_reserve_keys.push(deposit.deposit_reserve);
+        }
+    }
+    for borrow in ob.borrows.iter() {
+        if borrow.borrow_reserve != Pubkey::default() && !obligation_reserve_keys.contains(&borrow.borrow_reserve) {
+            obligation_reserve_keys.push(borrow.borrow_reserve);
+        }
+    }
+
+    // Fetch fresh reserves for this obligation to avoid stale cumulative_borrow_rate
+    // This prevents NegativeInterestRate errors when obligation was refreshed more recently than cached reserves
+    info!("Fetching fresh {} reserves for obligation", obligation_reserve_keys.len());
+    for reserve_key in &obligation_reserve_keys {
+        match klend_client.client.get_anchor_account::<Reserve>(reserve_key).await {
+            Ok(fresh_reserve) => {
+                reserves.insert(*reserve_key, fresh_reserve);
+            }
+            Err(e) => {
+                warn!("Failed to fetch fresh reserve {}: {:?}, using cached", reserve_key, e);
+            }
+        }
+    }
+    info!("Using {} reserves for market {}", reserves.len(), ob.lending_market);
+
+    // Create a minimal Clock from Geyser slot (only slot is used in liquidation path)
+    let clock = solana_sdk::clock::Clock {
+        slot,
+        epoch_start_timestamp: 0,
+        epoch: 0,
+        leader_schedule_epoch: 0,
+        unix_timestamp: 0,
+    };
+
+    // Pick debt and coll reserves to liquidate
+    let debt_res_key = ob.borrows
+        .iter()
+        .find(|b| b.borrow_reserve != Pubkey::default())
+        .ok_or_else(|| anyhow::anyhow!("No valid borrow reserves in obligation"))?
+        .borrow_reserve;
+    let coll_res_key = ob.deposits
+        .iter()
+        .find(|d| d.deposit_reserve != Pubkey::default())
+        .ok_or_else(|| anyhow::anyhow!("No valid deposit reserves in obligation"))?
+        .deposit_reserve;
+    info!("Selected debt_reserve={} coll_reserve={}", debt_res_key, coll_res_key);
+
+    // Refresh reserves and obligation (still fetches oracle prices - can't avoid for accuracy)
+    operations::refresh_reserves_and_obligation(
+        klend_client,
+        &debt_res_key,
+        &coll_res_key,
+        obligation_pubkey,
+        &mut ob,
+        &mut reserves,
+        rts,
+        market,
+        &clock,
+    )
+    .await?;
+
+    // Now it's all fully refreshed and up to date
+    let debt_reserve_state = *reserves.get(&debt_res_key).ok_or_else(|| {
+        anyhow::anyhow!("Debt reserve {} not found in reserves map", debt_res_key)
+    })?;
+    let coll_reserve_state = *reserves.get(&coll_res_key).ok_or_else(|| {
+        anyhow::anyhow!("Collateral reserve {} not found in reserves map", coll_res_key)
+    })?;
+    let debt_mint = debt_reserve_state.liquidity.mint_pubkey;
+    let debt_reserve = StateWithKey::new(debt_reserve_state, debt_res_key);
+    let coll_reserve = StateWithKey::new(coll_reserve_state, coll_res_key);
+    let lending_market = StateWithKey::new(*market, ob.lending_market);
+    let obligation_state = StateWithKey::new(ob, *obligation_pubkey);
+    // Skip slow price fetch - holdings aren't used in decide_liquidation_strategy for flash loans
+    let holdings = Holdings::default();
+
+    let deposit_reserves: Vec<StateWithKey<Reserve>> = ob
+        .deposits
+        .iter()
+        .filter(|coll| coll.deposit_reserve != Pubkey::default())
+        .map(|coll| {
+            StateWithKey::new(
+                *reserves.get(&coll.deposit_reserve).unwrap(),
+                coll.deposit_reserve,
+            )
+        })
+        .collect();
+
+    let max_allowed_ltv_override_pct_opt = Some(10);
+    let liquidation_swap_slippage_pct = 0.5;
+    let min_acceptable_received_collateral_amount = 1;
+    let liquidation_strategy = math::decide_liquidation_strategy(
+        &rebalance_config.base_token,
+        &obligation_state,
+        &lending_market,
+        &coll_reserve,
+        &debt_reserve,
+        &clock,
+        max_allowed_ltv_override_pct_opt,
+        liquidation_swap_slippage_pct,
+        holdings,
+    )?;
+
+    let (liquidate_amount, expected_collateral) = match liquidation_strategy {
+        Some(LiquidationStrategy::FlashLoanLiquidate(liquidate_amount, expected_collateral)) => {
+            (liquidate_amount, expected_collateral)
+        }
+        Some(LiquidationStrategy::LiquidateAndRedeem(liquidate_amount)) => (liquidate_amount, 0),
+        Some(LiquidationStrategy::SwapThenLiquidate(_, liquidate_amount)) => (liquidate_amount, 0),
+        None => {
+            info!("No liquidation strategy available");
+            return Ok(());
+        }
+    };
+
+    // Simulate liquidation
+    let res = kamino_lending::lending_market::lending_operations::liquidate_and_redeem(
+        &lending_market.state.borrow(),
+        &debt_reserve,
+        &coll_reserve,
+        &mut obligation_state.state.borrow_mut(),
+        &clock,
+        liquidate_amount,
+        min_acceptable_received_collateral_amount,
+        max_allowed_ltv_override_pct_opt,
+        deposit_reserves.into_iter(),
+    );
+
+    println!("Simulating the liquidation {:#?}", res);
+
+    if res.is_ok() {
+        let user = klend_client.liquidator.wallet.pubkey();
+        let coll_mint = coll_reserve.state.borrow().liquidity.mint_pubkey;
+
+        let mut ixns = vec![];
+        let mut luts = vec![];
+
+        // Get user's ATA for debt token
+        let debt_token_ata = {
+            let atas = klend_client.liquidator.atas.read().unwrap();
+            *atas.get(&debt_mint).ok_or_else(|| anyhow::anyhow!("No ATA for debt mint {}", debt_mint))?
+        };
+
+        // Calculate flash loan fee and repay amount
+        let flash_loan_fee_sf = debt_reserve.state.borrow().config.fees.flash_loan_fee_sf;
+        let fee = (liquidate_amount as u128 * flash_loan_fee_sf as u128 / 1_000_000_000_000_000_000) as u64;
+        let repay_amount = liquidate_amount + fee + 1; // +1 for rounding
+
+        // 1. Flash borrow instruction
+        let flash_borrow_ix = instructions::flash_borrow_reserve_liquidity_ix(
+            &klend_client.program_id,
+            &lending_market.key,
+            &debt_reserve,
+            &debt_token_ata,
+            &klend_client.liquidator,
+            liquidate_amount,
+            None,
+            None,
+        );
+
+        ixns.push(flash_borrow_ix.instruction);
+        // Flash borrow is at index 0 in our list, but build_with_budget_and_fee prepends ComputeBudget ixs
+        let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
+
+        // 2. Build liquidation instructions
+        let liquidate_ixns = klend_client
+            .liquidate_obligation_and_redeem_reserve_collateral_ixns(
+                lending_market.clone(),
+                debt_reserve.clone(),
+                coll_reserve.clone(),
+                obligation_state.clone(),
+                liquidate_amount,
+                min_acceptable_received_collateral_amount,
+                max_allowed_ltv_override_pct_opt,
+            )
+            .await?;
+        ixns.extend_from_slice(&liquidate_ixns);
+
+        // 3. Swap collateral back to debt token (if different)
+        if coll_mint != debt_mint {
+            let swap_result = match get_best_swap_instructions(
+                &coll_mint,
+                &debt_mint,
+                expected_collateral,
+                true, // only_direct_routes
+                Some(100), // slippage_bps
+                Some(5.0), // price_impact_limit
+                user,
+                &klend_client.client.client,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(
+                        "No swap route found from {} to {}: {:?}, skipping liquidation",
+                        coll_mint, debt_mint, e
+                    );
+                    return Ok(());
+                }
+            };
+
+            // PROFITABILITY CHECK
+            let swap_out_amount = swap_result.route.out_amount;
+            info!(
+                "Swap quote: in={} out={} (need {} to repay flash loan)",
+                swap_result.route.in_amount, swap_out_amount, repay_amount
+            );
+
+            if swap_out_amount < repay_amount {
+                let loss = repay_amount - swap_out_amount;
+                warn!(
+                    "UNPROFITABLE: Swap output {} < repay amount {}. Would lose {} debt tokens. Skipping.",
+                    swap_out_amount, repay_amount, loss
+                );
+                return Ok(());
+            }
+
+            let profit = swap_out_amount - repay_amount;
+            info!(
+                "PROFITABLE: Expected profit = {} debt tokens (swap_out={} - repay={})",
+                profit, swap_out_amount, repay_amount
+            );
+
+            let SwapResult { route: _, tx: swap_tx } = swap_result;
+            let DecompiledVersionedTx {
+                lookup_tables,
+                instructions: swap_ixs,
+            } = swap_tx;
+
+            // Filter compute budget ixns
+            let swap_ixs = swap_ixs
+                .into_iter()
+                .filter(|ix| ix.program_id != compute_budget::id())
+                .collect_vec();
+
+            ixns.extend_from_slice(&swap_ixs);
+
+            if let Some(lookup_tables) = lookup_tables {
+                for table in lookup_tables.into_iter() {
+                    luts.push(table);
+                }
+            }
+        }
+
+        // 4. Flash repay
+        let flash_repay_ix = instructions::flash_repay_reserve_liquidity_ix(
+            &klend_client.program_id,
+            &lending_market.key,
+            &debt_reserve,
+            &debt_token_ata,
+            &klend_client.liquidator,
+            repay_amount,
+            flash_borrow_index,
+            None,
+            None,
+        );
+        ixns.push(flash_repay_ix.instruction);
+
+        info!(
+            "Flash loan liquidation: borrow={}, repay={} (fee={}), expected_collateral={}",
+            liquidate_amount,
+            repay_amount,
+            repay_amount - liquidate_amount,
+            expected_collateral
+        );
+
+        // Build transaction with lookup tables
+        let swap_luts_count = luts.len();
+        let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
+
+        // Add liquidator lookup table
+        let mut total_luts = 0;
+        if let Some(liquidator_lut) = klend_client.get_lookup_table(&lending_market.key) {
+            info!("Adding liquidator lookup table with {} addresses", liquidator_lut.addresses.len());
+            txn = txn.add_lookup_table(liquidator_lut);
+            total_luts += 1;
+        }
+
+        // Add swap lookup tables
+        for lut in luts {
+            txn = txn.add_lookup_table(lut);
+            total_luts += 1;
+        }
+
+        // Build the versioned transaction with lookup tables first
+        let txn = match txn.build_with_budget_and_fee(&[]).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to build transaction: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        // Check transaction size using the actual serialized versioned transaction
+        let txn_bytes = bincode::serialize(&txn).unwrap_or_default();
+        let txn_size = txn_bytes.len();
+        const MAX_TX_SIZE: usize = 1232; // Solana raw transaction limit
+
+        if txn_size > MAX_TX_SIZE {
+            warn!(
+                "Transaction too large: {} bytes (max {}). Skipping liquidation.",
+                txn_size, MAX_TX_SIZE
+            );
+            info!(
+                "Debug: {} instructions, {} lookup tables ({} liquidator, {} swap)",
+                ixns.len(),
+                total_luts,
+                if klend_client.get_lookup_table(&lending_market.key).is_some() { 1 } else { 0 },
+                swap_luts_count
+            );
+            return Ok(());
+        }
+
+        info!(
+            "Transaction size: {} bytes ({:.1}% of max)",
+            txn_size,
+            (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
+        );
+        let txn_b64 = BS64.encode(&txn_bytes);
+        println!(
+            "Simulation: https://explorer.solana.com/tx/inspector?message={}",
+            urlencoding::encode(&txn_b64)
+        );
+
+        let res = match klend_client
+            .client
+            .client
+            .simulate_transaction(&txn)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Transaction simulation failed: {:?}", e);
+                return Ok(());
+            }
+        };
+
         if let Some(err) = res.value.err {
             warn!("Simulation returned error: {:?}", err);
             if let Some(logs) = &res.value.logs {
@@ -1031,28 +1434,20 @@ async fn crank_stream(
     klend_client: &KlendClient,
     geyser_endpoint: String,
     geyser_api_key: String,
+    state_refresh_hours: u64,
 ) -> Result<()> {
-    info!("Starting stream-based crank with Geyser/LaserStream");
+    info!("Starting stream-based crank with Geyser/LaserStream (state refresh every {} hours)", state_refresh_hours);
 
     // Get lending markets to monitor
     let lending_markets = get_lending_markets(klend_client).await?;
     info!("Monitoring {} markets: {:?}", lending_markets.len(), lending_markets);
 
-    // Connect to Geyser
-    let geyser_config = GeyserConfig {
-        endpoint: geyser_endpoint,
-        api_key: geyser_api_key,
-        program_id: klend_client.program_id,
-    };
-
-    let mut geyser_stream = GeyserStream::connect(geyser_config).await?;
-    info!("Connected to Geyser stream");
-
-    // Load initial state for all markets
+    // Load initial state for all markets BEFORE connecting to Geyser
+    // This prevents the Geyser channel from filling up during initialization
     let mut market_states: HashMap<Pubkey, MarketState> = HashMap::new();
     for market in &lending_markets {
         info!("Loading initial state for market {}", market.to_string().green());
-        match load_market_state(klend_client, market).await {
+        match load_market_state(klend_client, market, true).await {
             Ok(state) => {
                 // Ensure ATAs exist for all reserve mints
                 if let Err(e) = klend_client
@@ -1070,10 +1465,20 @@ async fn crank_stream(
         }
     }
 
+    // Connect to Geyser AFTER initialization is complete
+    let geyser_config = GeyserConfig {
+        endpoint: geyser_endpoint,
+        api_key: geyser_api_key,
+        program_id: klend_client.program_id,
+    };
+
+    let mut geyser_stream = GeyserStream::connect(geyser_config).await?;
+    info!("Connected to Geyser stream");
+
     // Track obligations we've seen and their LTVs
     let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
     let mut last_state_refresh = std::time::Instant::now();
-    let state_refresh_interval = Duration::from_secs(3600); // Refresh full state every 60 min (fallback only)
+    let state_refresh_interval = Duration::from_secs(state_refresh_hours * 3600);
 
     info!("Starting to process obligation updates...");
 
@@ -1082,7 +1487,8 @@ async fn crank_stream(
         if last_state_refresh.elapsed() > state_refresh_interval {
             info!("Refreshing market states (periodic refresh)");
             for market in &lending_markets {
-                if let Ok(state) = load_market_state(klend_client, market).await {
+                // Skip ALT updates during periodic refresh to avoid blocking
+                if let Ok(state) = load_market_state(klend_client, market, false).await {
                     // Ensure ATAs exist for any new reserve mints
                     if let Err(e) = klend_client
                         .liquidator
@@ -1149,9 +1555,28 @@ async fn crank_stream(
                                     start.elapsed().as_millis()
                                 );
 
-                                // Trigger liquidation
-                                if let Err(e) = liquidate(klend_client, &obligation_update.pubkey).await {
-                                    warn!("Liquidation failed for {}: {:?}", obligation_update.pubkey, e);
+                                // Trigger liquidation (fast path using cached data)
+                                if let Err(e) = liquidate_fast(
+                                    klend_client,
+                                    &obligation_update.pubkey,
+                                    obligation.clone(),
+                                    market_state,
+                                    obligation_update.slot,
+                                ).await {
+                                    // Classify errors: protocol errors are expected, others are warnings
+                                    let err_str = format!("{:?}", e);
+                                    if err_str.contains("NegativeInterestRate")
+                                        || err_str.contains("ObligationStale")
+                                        || err_str.contains("ReserveStale") {
+                                        info!("Skipping {} (protocol state issue): {}",
+                                            obligation_update.pubkey,
+                                            e.to_string().split("error_msg:").nth(1)
+                                                .and_then(|s| s.split(',').next())
+                                                .unwrap_or(&err_str)
+                                        );
+                                    } else {
+                                        warn!("Liquidation failed for {}: {:?}", obligation_update.pubkey, e);
+                                    }
                                 }
                             } else if ltv_changed && ltv_info.ltv > Fraction::ZERO {
                                 // Log obligations with non-zero LTV for awareness
@@ -1199,13 +1624,17 @@ struct MarketState {
 }
 
 /// Load the full state for a market
-async fn load_market_state(klend_client: &KlendClient, market: &Pubkey) -> Result<MarketState> {
+/// If `update_lookup_table` is true, will create/extend the lookup table (slow, only do at startup)
+async fn load_market_state(klend_client: &KlendClient, market: &Pubkey, update_lookup_table: bool) -> Result<MarketState> {
     let market_accs = klend_client.fetch_market_and_reserves(market).await?;
     let rts = klend_client.fetch_referrer_token_states().await?;
 
     // Load/update the liquidator lookup table for this market (reduces transaction size)
-    if let Err(e) = klend_client.load_lookup_table(market, &market_accs).await {
-        warn!("Failed to load lookup table for market {}: {:?}", market, e);
+    // Only extend at startup - periodic refresh should not block on ALT updates
+    if update_lookup_table {
+        if let Err(e) = klend_client.load_lookup_table(market, &market_accs).await {
+            warn!("Failed to load lookup table for market {}: {:?}", market, e);
+        }
     }
 
     let OracleAccounts {

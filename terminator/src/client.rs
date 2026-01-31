@@ -30,7 +30,7 @@ use solana_sdk::{
     transaction::{TransactionError, VersionedTransaction},
 };
 use tokio::task;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     accounts::{find_account, market_and_reserve_accounts, MarketAccounts},
@@ -338,7 +338,7 @@ impl KlendClient {
             // Only add keys up to the 256 limit
             let space_available = MAX_LUT_ADDRESSES.saturating_sub(current_count);
             if space_available == 0 {
-                info!("Lookup table for market {} is full (256 addresses)", market);
+                warn!("Lookup table for market {} is full (256 addresses)", market);
                 return Ok(());
             }
 

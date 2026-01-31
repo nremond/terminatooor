@@ -897,12 +897,16 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 
 /// Fast liquidation path for streaming mode - uses cached data to minimize RPC calls
 /// Saves ~250ms by avoiding redundant fetches of obligation, reserves, referrer_token_states
+///
+/// `ltv_margin_pct` is how far over the unhealthy threshold the LTV is (as a ratio, e.g., 0.05 = 5%)
+/// If margin is high enough, we skip simulation to send faster
 async fn liquidate_fast(
     klend_client: &KlendClient,
     obligation_pubkey: &Pubkey,
     obligation: Obligation,
     market_state: &MarketState,
     slot: u64,
+    ltv_margin_pct: f64,
 ) -> Result<()> {
     info!("Liquidating obligation {} (fast path)", obligation_pubkey.to_string().green());
     let rebalance_config = match &klend_client.rebalance_config {
@@ -1253,44 +1257,58 @@ async fn liquidate_fast(
             txn_size,
             (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
         );
-        let txn_b64 = BS64.encode(&txn_bytes);
-        println!(
-            "Simulation: https://explorer.solana.com/tx/inspector?message={}",
-            urlencoding::encode(&txn_b64)
-        );
 
-        let res = match klend_client
-            .client
-            .client
-            .simulate_transaction(&txn)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Transaction simulation failed: {:?}", e);
-                return Ok(());
-            }
-        };
+        // Skip simulation if LTV is significantly over threshold (>1%) for faster execution
+        // Marginal liquidations (barely over threshold) are likely to be race conditions anyway
+        const SKIP_SIMULATION_THRESHOLD: f64 = 0.01; // 1% over unhealthy threshold
+        let skip_simulation = ltv_margin_pct > SKIP_SIMULATION_THRESHOLD;
 
-        if let Some(err) = res.value.err {
-            // Check if obligation became healthy (race condition - expected behavior)
-            let is_healthy_error = res.value.logs.as_ref().map_or(false, |logs| {
-                logs.iter().any(|log| log.contains("ObligationHealthy"))
-            });
-            if is_healthy_error {
-                info!("Obligation recovered before liquidation (LTV now healthy)");
-            } else {
-                warn!("Simulation returned error: {:?}", err);
-                if let Some(logs) = &res.value.logs {
-                    for log in logs.iter().rev().take(5) {
-                        warn!("  Log: {}", log);
+        if skip_simulation {
+            info!(
+                "Skipping simulation (LTV margin {:.2}% > {:.0}% threshold) for faster execution",
+                ltv_margin_pct * 100.0,
+                SKIP_SIMULATION_THRESHOLD * 100.0
+            );
+        } else {
+            let txn_b64 = BS64.encode(&txn_bytes);
+            println!(
+                "Simulation: https://explorer.solana.com/tx/inspector?message={}",
+                urlencoding::encode(&txn_b64)
+            );
+
+            let res = match klend_client
+                .client
+                .client
+                .simulate_transaction(&txn)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Transaction simulation failed: {:?}", e);
+                    return Ok(());
+                }
+            };
+
+            if let Some(err) = res.value.err {
+                // Check if obligation became healthy (race condition - expected behavior)
+                let is_healthy_error = res.value.logs.as_ref().map_or(false, |logs| {
+                    logs.iter().any(|log| log.contains("ObligationHealthy"))
+                });
+                if is_healthy_error {
+                    info!("Obligation recovered before liquidation (LTV now healthy)");
+                } else {
+                    warn!("Simulation returned error: {:?}", err);
+                    if let Some(logs) = &res.value.logs {
+                        for log in logs.iter().rev().take(5) {
+                            warn!("  Log: {}", log);
+                        }
                     }
                 }
+                return Ok(());
             }
-            return Ok(());
-        }
 
-        info!("Simulation succeeded, units consumed: {:?}", res.value.units_consumed);
+            info!("Simulation succeeded, units consumed: {:?}", res.value.units_consumed);
+        }
 
         let should_send = true;
 
@@ -1595,6 +1613,15 @@ async fn crank_stream(
                                     start.elapsed().as_millis()
                                 );
 
+                                // Calculate LTV margin (how far over threshold)
+                                let ltv_margin_pct = if ltv_info.unhealthy_ltv > Fraction::ZERO {
+                                    let ltv_f64: f64 = ltv_info.ltv.to_num();
+                                    let unhealthy_f64: f64 = ltv_info.unhealthy_ltv.to_num();
+                                    (ltv_f64 - unhealthy_f64) / unhealthy_f64
+                                } else {
+                                    0.0
+                                };
+
                                 // Trigger liquidation (fast path using cached data)
                                 if let Err(e) = liquidate_fast(
                                     klend_client,
@@ -1602,6 +1629,7 @@ async fn crank_stream(
                                     obligation.clone(),
                                     market_state,
                                     obligation_update.slot,
+                                    ltv_margin_pct,
                                 ).await {
                                     // Classify errors: protocol errors are expected, others are warnings
                                     let err_str = format!("{:?}", e);

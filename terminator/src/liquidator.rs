@@ -47,6 +47,8 @@ impl Holdings {
 pub struct Liquidator {
     pub wallet: Arc<Keypair>,
     pub atas: RwLock<HashMap<Pubkey, Pubkey>>,
+    /// Maps mint -> token program (SPL Token or Token2022)
+    pub mint_token_programs: RwLock<HashMap<Pubkey, Pubkey>>,
 }
 
 fn label_of(mint: &Pubkey, reserves: &HashMap<Pubkey, Reserve>) -> String {
@@ -98,9 +100,21 @@ impl Liquidator {
             None => Arc::new(Keypair::new()),
         };
 
+        // Fetch token programs for all mints
+        let mut mint_token_programs = HashMap::new();
+        for chunk in mints.chunks(100) {
+            let accounts = client.client.client.get_multiple_accounts(chunk).await?;
+            for (i, account) in accounts.iter().enumerate() {
+                if let Some(acc) = account {
+                    mint_token_programs.insert(chunk[i], acc.owner);
+                }
+            }
+        }
+
         let liquidator = Liquidator {
             wallet,
             atas: RwLock::new(atas),
+            mint_token_programs: RwLock::new(mint_token_programs),
         };
 
         Ok(liquidator)
@@ -216,13 +230,34 @@ impl Liquidator {
         }
 
         // Store all ATAs (both existing and newly created)
-        let mut atas = self.atas.write().unwrap();
-        for (i, mint) in mints.iter().enumerate() {
-            atas.insert(*mint, ata_addresses[i]);
+        {
+            let mut atas = self.atas.write().unwrap();
+            for (i, mint) in mints.iter().enumerate() {
+                atas.insert(*mint, ata_addresses[i]);
+            }
+            info!("Liquidator now has {} token ATAs", atas.len());
         }
 
-        info!("Liquidator now has {} token ATAs", atas.len());
+        // Store token programs
+        {
+            let mut programs = self.mint_token_programs.write().unwrap();
+            for (mint, token_program) in mint_token_programs {
+                programs.insert(mint, token_program);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Get the token program for a mint (SPL Token or Token2022)
+    /// Returns SPL Token as default if not found
+    pub fn token_program_for_mint(&self, mint: &Pubkey) -> Pubkey {
+        self.mint_token_programs
+            .read()
+            .unwrap()
+            .get(mint)
+            .copied()
+            .unwrap_or(Token::id())
     }
 
     pub async fn fetch_holdings(

@@ -647,6 +647,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         };
 
         // 1. Flash borrow the debt token
+        let debt_token_program = klend_client.liquidator.token_program_for_mint(&debt_mint);
         let flash_borrow_ix = instructions::flash_borrow_reserve_liquidity_ix(
             &klend_client.program_id,
             &lending_market.key,
@@ -656,6 +657,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             liquidate_amount,
             None, // referrer_token_state
             None, // referrer_account
+            debt_token_program,
         );
         ixns.push(flash_borrow_ix.instruction);
         // Flash borrow is at index 0 in our list, but build_with_budget_and_fee prepends ComputeBudget ixs
@@ -768,6 +770,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             flash_borrow_index,
             None, // referrer_token_state
             None, // referrer_account
+            debt_token_program,
         );
         ixns.push(flash_repay_ix.instruction);
 
@@ -1073,6 +1076,7 @@ async fn liquidate_fast(
         let repay_amount = liquidate_amount + fee + 1; // +1 for rounding
 
         // 1. Flash borrow instruction
+        let debt_token_program = klend_client.liquidator.token_program_for_mint(&debt_mint);
         let flash_borrow_ix = instructions::flash_borrow_reserve_liquidity_ix(
             &klend_client.program_id,
             &lending_market.key,
@@ -1082,6 +1086,7 @@ async fn liquidate_fast(
             liquidate_amount,
             None,
             None,
+            debt_token_program,
         );
 
         ixns.push(flash_borrow_ix.instruction);
@@ -1184,6 +1189,7 @@ async fn liquidate_fast(
             flash_borrow_index,
             None,
             None,
+            debt_token_program,
         );
         ixns.push(flash_repay_ix.instruction);
 

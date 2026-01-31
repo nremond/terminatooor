@@ -86,6 +86,7 @@ pub fn collect_keys(
 
     // Add common program IDs and sysvars (these compress well in ALTs)
     keys.insert(anchor_spl::token::ID);
+    keys.insert(anchor_spl::token_2022::ID);
     keys.insert(solana_sdk::system_program::ID);
     keys.insert(solana_sdk::sysvar::instructions::ID);
     keys.insert(solana_sdk::sysvar::rent::ID);

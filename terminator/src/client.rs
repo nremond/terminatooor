@@ -85,6 +85,7 @@ impl KlendClient {
         let liquidator = Liquidator {
             wallet,
             atas: RwLock::new(HashMap::new()),
+            mint_token_programs: RwLock::new(HashMap::new()),
         };
 
         Ok(Self {

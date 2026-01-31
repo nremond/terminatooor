@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anchor_client::solana_sdk::{instruction::Instruction, pubkey::Pubkey, signature::Keypair};
 use anchor_lang::{prelude::Rent, system_program::System, Id, InstructionData, ToAccountMetas};
-use anchor_spl::token::Token;
 use kamino_lending::{LendingMarket, Reserve, ReserveFarmKind};
 use solana_sdk::{
     signer::Signer,
@@ -55,6 +54,11 @@ pub fn liquidate_obligation_and_redeem_reserve_collateral_ix(
         )
     };
 
+    // Get the correct token programs for each mint
+    let repay_token_program = liquidator.token_program_for_mint(&debt_token);
+    let collateral_token_program = liquidator.token_program_for_mint(&collateral_ctoken);
+    let withdraw_token_program = liquidator.token_program_for_mint(&collateral_token);
+
     let instruction = Instruction {
         program_id: *program_id,
         accounts: kamino_lending::accounts::LiquidateObligationAndRedeemReserveCollateral {
@@ -73,11 +77,11 @@ pub fn liquidate_obligation_and_redeem_reserve_collateral_ix(
             user_destination_liquidity,
             user_source_liquidity,
             instruction_sysvar_account: sysvar::instructions::ID,
-            repay_liquidity_token_program: Token::id(),
+            repay_liquidity_token_program: repay_token_program,
             repay_reserve_liquidity_mint: debt_reserve_state.liquidity.mint_pubkey,
             withdraw_reserve_liquidity_mint: coll_reserve_state.liquidity.mint_pubkey,
-            collateral_token_program: Token::id(), // TODO: add Token2022
-            withdraw_liquidity_token_program: Token::id(), // TODO: add Token2022
+            collateral_token_program,
+            withdraw_liquidity_token_program: withdraw_token_program,
         }
         .to_account_metas(None),
         data: kamino_lending::instruction::LiquidateObligationAndRedeemReserveCollateral {
@@ -305,6 +309,7 @@ pub fn flash_borrow_reserve_liquidity_ix(
     liquidity_amount: u64,
     referrer_token_state: Option<Pubkey>,
     referrer_account: Option<Pubkey>,
+    token_program: Pubkey,
 ) -> InstructionBlocks {
     let lending_market_authority =
         kamino_lending::utils::seeds::pda::lending_market_auth(lending_market);
@@ -325,7 +330,7 @@ pub fn flash_borrow_reserve_liquidity_ix(
             referrer_token_state,
             referrer_account,
             sysvar_info: sysvar::instructions::ID,
-            token_program: Token::id(),
+            token_program,
         }
         .to_account_metas(None),
         data: kamino_lending::instruction::FlashBorrowReserveLiquidity { liquidity_amount }.data(),
@@ -350,6 +355,7 @@ pub fn flash_repay_reserve_liquidity_ix(
     borrow_instruction_index: u8,
     referrer_token_state: Option<Pubkey>,
     referrer_account: Option<Pubkey>,
+    token_program: Pubkey,
 ) -> InstructionBlocks {
     let lending_market_authority =
         kamino_lending::utils::seeds::pda::lending_market_auth(lending_market);
@@ -370,7 +376,7 @@ pub fn flash_repay_reserve_liquidity_ix(
             referrer_token_state,
             referrer_account,
             sysvar_info: sysvar::instructions::ID,
-            token_program: Token::id(),
+            token_program,
         }
         .to_account_metas(None),
         data: kamino_lending::instruction::FlashRepayReserveLiquidity {

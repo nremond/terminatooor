@@ -1,4 +1,5 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, panic::AssertUnwindSafe, path::PathBuf, sync::Arc, time::Duration};
+use futures::FutureExt;
 
 use anchor_client::{solana_sdk::pubkey::Pubkey, Cluster};
 use base64::engine::{general_purpose::STANDARD as BS64, Engine};
@@ -664,7 +665,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
         // 2. Liquidation instructions (use original obligation, not the simulation-mutated one)
-        // Skip post-farm refresh to fit within tx size limit for flash loan liquidations
+        // Include post-farm refresh - required by on-chain check_refresh validation
         let liquidate_ixns = klend_client
             .liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
@@ -674,7 +675,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
                 liquidate_amount,
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
-                true, // skip_post_farm_refresh for flash loan tx size
+                false, // Must include post-farm refresh for on-chain validation
             )
             .await?;
         ixns.extend_from_slice(&liquidate_ixns);
@@ -1100,7 +1101,7 @@ async fn liquidate_fast(
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
         // 2. Build liquidation instructions (use original obligation, not the simulation-mutated one)
-        // Skip post-farm refresh to fit within tx size limit for flash loan liquidations
+        // Include post-farm refresh - required by on-chain check_refresh validation
         let liquidate_ixns = klend_client
             .liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
@@ -1110,7 +1111,7 @@ async fn liquidate_fast(
                 liquidate_amount,
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
-                true, // skip_post_farm_refresh for flash loan tx size
+                false, // Must include post-farm refresh for on-chain validation
             )
             .await?;
         ixns.extend_from_slice(&liquidate_ixns);
@@ -1625,27 +1626,47 @@ async fn crank_stream(
                                 };
 
                                 // Trigger liquidation (fast path using cached data)
-                                if let Err(e) = liquidate_fast(
+                                // Wrap with catch_unwind to handle panics from klend library
+                                // (e.g., unsupported price exponents like exp=31)
+                                let liquidation_result = AssertUnwindSafe(liquidate_fast(
                                     klend_client,
                                     &obligation_update.pubkey,
                                     obligation.clone(),
                                     market_state,
                                     obligation_update.slot,
                                     ltv_margin_pct,
-                                ).await {
-                                    // Classify errors: protocol errors are expected, others are warnings
-                                    let err_str = format!("{:?}", e);
-                                    if err_str.contains("NegativeInterestRate")
-                                        || err_str.contains("ObligationStale")
-                                        || err_str.contains("ReserveStale") {
-                                        info!("Skipping {} (protocol state issue): {}",
-                                            obligation_update.pubkey,
-                                            e.to_string().split("error_msg:").nth(1)
-                                                .and_then(|s| s.split(',').next())
-                                                .unwrap_or(&err_str)
-                                        );
-                                    } else {
-                                        warn!("Liquidation failed for {}: {:?}", obligation_update.pubkey, e);
+                                )).catch_unwind().await;
+
+                                match liquidation_result {
+                                    Ok(Ok(())) => {
+                                        // Liquidation succeeded
+                                    }
+                                    Ok(Err(e)) => {
+                                        // Normal error handling
+                                        let err_str = format!("{:?}", e);
+                                        if err_str.contains("NegativeInterestRate")
+                                            || err_str.contains("ObligationStale")
+                                            || err_str.contains("ReserveStale") {
+                                            info!("Skipping {} (protocol state issue): {}",
+                                                obligation_update.pubkey,
+                                                e.to_string().split("error_msg:").nth(1)
+                                                    .and_then(|s| s.split(',').next())
+                                                    .unwrap_or(&err_str)
+                                            );
+                                        } else {
+                                            warn!("Liquidation failed for {}: {:?}", obligation_update.pubkey, e);
+                                        }
+                                    }
+                                    Err(panic_info) => {
+                                        // Panic occurred (e.g., unsupported price exponent in klend)
+                                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                            s.to_string()
+                                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                            s.clone()
+                                        } else {
+                                            "Unknown panic".to_string()
+                                        };
+                                        warn!("Liquidation panicked for {}: {}", obligation_update.pubkey, panic_msg);
                                     }
                                 }
                             } else if ltv_changed && ltv_info.ltv > Fraction::ZERO {

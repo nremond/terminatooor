@@ -14,7 +14,7 @@ staging = ["kamino_lending/staging"]
 
 [dependencies]
 anchor-client = "0.29.0"
-kamino_lending = { git = "https://github.com/Kamino-Finance/klend", default-features = false, features = ["no-entrypoint"] }
+kamino_lending = { git = "https://github.com/Kamino-Finance/klend", rev = "c02bcf7", default-features = false, features = ["no-entrypoint"] }
 anyhow = "1.0.0"
 aws-config = "1.1.6"
 aws-sdk-sns = "1.15.0"

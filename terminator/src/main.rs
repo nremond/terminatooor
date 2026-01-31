@@ -941,9 +941,11 @@ async fn liquidate_fast(
     }
     info!("Using {} reserves for market {}", reserves.len(), ob.lending_market);
 
-    // Create a minimal Clock from Geyser slot (only slot is used in liquidation path)
+    // Fetch current slot from RPC - Geyser slot may be stale compared to RPC data
+    // This ensures our clock matches the slot at which we fetched fresh reserves
+    let rpc_slot = klend_client.client.client.get_slot().await.unwrap_or(slot);
     let clock = solana_sdk::clock::Clock {
-        slot,
+        slot: rpc_slot,
         epoch_start_timestamp: 0,
         epoch: 0,
         leader_schedule_epoch: 0,

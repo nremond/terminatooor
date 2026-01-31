@@ -452,6 +452,7 @@ mod tests {
             ).await {
                 Ok((quote, swap_ixs)) => {
                     println!("  Quote: in={} out={}", quote.in_amount, quote.out_amount);
+                    println!("  Swap program_id: {}", swap_ixs.swap_instruction.program_id);
                     println!("  Compute budget ixs: {}", swap_ixs.compute_budget_instructions.len());
                     println!("  Setup ixs: {}", swap_ixs.setup_instructions.len());
                     println!("  Swap ix accounts: {}", swap_ixs.swap_instruction.accounts.len());

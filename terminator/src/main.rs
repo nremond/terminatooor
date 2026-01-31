@@ -948,11 +948,13 @@ async fn liquidate_fast(
     }
     info!("Using {} reserves for market {}", reserves.len(), ob.lending_market);
 
-    // Fetch current slot from RPC - Geyser slot may be stale compared to RPC data
-    // This ensures our clock matches the slot at which we fetched fresh reserves
+    // Use the maximum slot from all sources plus a buffer to ensure clock is not behind any data.
+    // RPC slot can lag behind Geyser or fetched data due to different endpoints/caching.
+    // The buffer accounts for this lag and prevents "reserve stale" errors.
     let rpc_slot = klend_client.client.client.get_slot().await.unwrap_or(slot);
+    let clock_slot = calculate_clock_slot(rpc_slot, slot);
     let clock = solana_sdk::clock::Clock {
-        slot: rpc_slot,
+        slot: clock_slot,
         epoch_start_timestamp: 0,
         epoch: 0,
         leader_schedule_epoch: 0,
@@ -1794,6 +1796,114 @@ fn deserialize_obligation(data: &[u8]) -> Option<Obligation> {
     match try_from_bytes::<Obligation>(obligation_data) {
         Ok(obligation) => Some(*obligation),
         Err(_) => None,
+    }
+}
+
+/// Buffer added to clock slot to account for RPC lag.
+/// RPC get_slot() can return a slot that's behind the slot of data we fetched,
+/// causing "reserve stale" errors when the reserve's last_update.slot is ahead.
+const CLOCK_SLOT_BUFFER: u64 = 100;
+
+/// Calculate the clock slot to use for liquidation operations.
+/// Takes the maximum of RPC slot and Geyser slot, then adds a buffer to ensure
+/// the clock is ahead of any fetched reserve data.
+///
+/// This fixes a race condition where:
+/// 1. We fetch reserve data from RPC (at slot X)
+/// 2. We call get_slot() which returns slot Y where Y < X
+/// 3. Reserve refresh fails because reserve.last_update.slot > clock.slot
+fn calculate_clock_slot(rpc_slot: u64, geyser_slot: u64) -> u64 {
+    rpc_slot.max(geyser_slot) + CLOCK_SLOT_BUFFER
+}
+
+#[cfg(test)]
+mod clock_slot_tests {
+    use super::*;
+
+    #[test]
+    fn test_clock_slot_uses_max_of_rpc_and_geyser() {
+        // When RPC slot is ahead
+        assert_eq!(calculate_clock_slot(1000, 900), 1000 + CLOCK_SLOT_BUFFER);
+
+        // When Geyser slot is ahead
+        assert_eq!(calculate_clock_slot(900, 1000), 1000 + CLOCK_SLOT_BUFFER);
+
+        // When both are equal
+        assert_eq!(calculate_clock_slot(1000, 1000), 1000 + CLOCK_SLOT_BUFFER);
+    }
+
+    #[test]
+    fn test_clock_slot_handles_rpc_lag_scenario() {
+        // Real scenario from logs:
+        // - Reserve data fetched at slot 397173192
+        // - RPC get_slot() returned 397173108 (84 slots behind)
+        // - Geyser slot was also stale
+        let rpc_slot = 397173108;
+        let geyser_slot = 397173100; // Even more stale
+        let reserve_slot = 397173192; // This is what the fetched reserve had
+
+        let clock_slot = calculate_clock_slot(rpc_slot, geyser_slot);
+
+        // The clock slot should be ahead of the reserve slot with the buffer
+        // In this case: max(397173108, 397173100) + 100 = 397173208
+        // Which is > 397173192 (reserve slot)
+        assert!(clock_slot > reserve_slot,
+            "clock_slot {} should be > reserve_slot {}", clock_slot, reserve_slot);
+    }
+
+    #[test]
+    fn test_clock_slot_buffer_prevents_stale_error() {
+        // If reserve is only slightly ahead of RPC (within buffer), we should still be safe
+        let rpc_slot = 1000;
+        let geyser_slot = 950;
+
+        // Reserve fetched could be up to ~100 slots ahead of RPC slot
+        // (typical RPC lag is 50-100 slots based on observations)
+        for reserve_ahead_by in [10, 50, 99] {
+            let reserve_slot = rpc_slot + reserve_ahead_by;
+            let clock_slot = calculate_clock_slot(rpc_slot, geyser_slot);
+
+            assert!(clock_slot > reserve_slot,
+                "With reserve {} slots ahead, clock_slot {} should be > reserve_slot {}",
+                reserve_ahead_by, clock_slot, reserve_slot);
+        }
+    }
+
+    #[test]
+    fn test_clock_slot_buffer_value() {
+        // Verify the buffer is reasonable (not too small, not too large)
+        // Too small: won't cover typical RPC lag
+        // Too large: might cause issues with slot-dependent calculations
+        assert!(CLOCK_SLOT_BUFFER >= 50, "Buffer should be at least 50 slots");
+        assert!(CLOCK_SLOT_BUFFER <= 200, "Buffer should not exceed 200 slots");
+    }
+
+    #[test]
+    fn test_multiple_reserves_ahead_scenario() {
+        // From logs: clock was 397173075, multiple reserves were ahead
+        // This caused MathOverflow when slots_elapsed was called
+        let rpc_slot = 397173000; // RPC returned this
+        let geyser_slot = 397173075; // Geyser had this
+
+        let clock_slot = calculate_clock_slot(rpc_slot, geyser_slot);
+
+        // Reserves that were ahead in the logs (estimated ~50-100 slots ahead)
+        // d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q
+        // febGYTnFX4GbSGoFHFeJXUHgNaK53fB23uDins9Jp1E
+        // D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
+        // H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S
+        let reserve_slots = [
+            geyser_slot + 50,  // 50 ahead
+            geyser_slot + 75,  // 75 ahead
+            geyser_slot + 90,  // 90 ahead
+            geyser_slot + 95,  // 95 ahead
+        ];
+
+        for reserve_slot in reserve_slots {
+            assert!(clock_slot > reserve_slot,
+                "clock_slot {} should be > reserve_slot {} (was {} slots ahead)",
+                clock_slot, reserve_slot, reserve_slot - geyser_slot);
+        }
     }
 }
 

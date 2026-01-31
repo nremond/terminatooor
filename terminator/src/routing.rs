@@ -1,58 +1,65 @@
+//! Swap routing module using Metis/Jupiter API
+//!
+//! This module provides swap functionality via Triton's Metis API,
+//! which returns address lookup tables for transaction compression.
+
 use std::collections::HashSet;
 
 use anchor_lang::prelude::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount};
+use solana_sdk::instruction::Instruction;
 use tracing::{info, warn};
 
 use crate::consts::{
     EXTRA_ACCOUNTS_BUFFER, MAX_ACCOUNTS_PER_TRANSACTION, MAX_EXTRA_ACCOUNTS_BUFFER,
 };
-use crate::titan::{self, DecompiledVersionedTx, Error as TitanError, SwapRoute, TitanResult};
+use crate::metis;
+
+/// Error type for routing operations
+#[derive(Debug)]
+pub enum RoutingError {
+    NoValidRoute,
+    PriceImpactTooHigh(f32),
+    ApiError(String),
+}
+
+impl std::fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoutingError::NoValidRoute => write!(f, "No valid route found"),
+            RoutingError::PriceImpactTooHigh(pct) => write!(f, "Price impact too high: {}%", pct),
+            RoutingError::ApiError(msg) => write!(f, "API error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for RoutingError {}
+
+pub type RoutingResult<T> = std::result::Result<T, RoutingError>;
+
+/// Decompiled transaction with instructions and lookup tables
+#[derive(Debug)]
+pub struct DecompiledVersionedTx {
+    pub instructions: Vec<Instruction>,
+    pub lookup_tables: Option<Vec<AddressLookupTableAccount>>,
+}
+
+/// Swap route information
+#[derive(Debug, Clone)]
+pub struct SwapRoute {
+    pub in_amount: u64,
+    pub out_amount: u64,
+    pub slippage_bps: u16,
+    pub price_impact_pct: String,
+    pub address_lookup_tables: Vec<Pubkey>,
+}
 
 /// Swap result containing both quote info and instructions
 #[derive(Debug)]
 pub struct SwapResult {
     pub route: SwapRoute,
     pub tx: DecompiledVersionedTx,
-}
-
-pub async fn get_best_swap_route(
-    input_mint: &Pubkey,
-    output_mint: &Pubkey,
-    amount: u64,
-    only_direct_routes: bool,
-    slippage_bps: Option<u16>,
-    price_impact_limit: Option<f32>,
-    max_accounts: Option<u8>,
-    user_public_key: Pubkey,
-) -> TitanResult<SwapRoute> {
-    let best_route = titan::get_quote(
-        input_mint,
-        output_mint,
-        amount,
-        only_direct_routes,
-        slippage_bps,
-        max_accounts,
-        user_public_key,
-    )
-    .await?;
-
-    // Handle empty or invalid price_impact_pct (Titan sometimes returns empty string)
-    let route_price_impact_pct = if best_route.price_impact_pct.is_empty() {
-        0.0
-    } else {
-        best_route
-            .price_impact_pct
-            .parse::<f32>()
-            .unwrap_or(0.0)
-    };
-    if let Some(price_impact_limit) = price_impact_limit {
-        if route_price_impact_pct > price_impact_limit {
-            return Err(TitanError::PriceImpactTooHigh(route_price_impact_pct));
-        }
-    }
-    Ok(best_route)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,8 +76,72 @@ pub async fn get_best_swap_instructions(
     rpc_client: &RpcClient,
     accounts: Option<&Vec<&Pubkey>>,
     accounts_count_buffer: Option<usize>,
-) -> TitanResult<SwapResult> {
-    // when we use swap + Kamino's swap rewards in a single transaction, the total number of unique accounts that we can lock (include) in the tx is 64. We need to count how many accounts the Kamino ix will use and require the API to give us a route that uses less than MAX_ACCOUNTS_PER_TRANSACTION - the amount of accounts that Kamino will use.
+) -> RoutingResult<SwapResult> {
+    // Try with the requested route type first
+    let result = get_best_swap_instructions_inner(
+        input_mint,
+        output_mint,
+        amount,
+        only_direct_routes,
+        slippage_bps,
+        price_impact_limit,
+        user_public_key,
+        rpc_client,
+        accounts,
+        accounts_count_buffer,
+    )
+    .await;
+
+    // If direct route succeeded but has no ALTs, try non-direct as fallback
+    // Non-direct routes might use DEXes that provide lookup tables
+    if only_direct_routes {
+        if let Ok(ref swap_result) = result {
+            if swap_result.route.address_lookup_tables.is_empty() {
+                info!("Direct route has no ALTs, trying non-direct route as fallback...");
+                let non_direct_result = get_best_swap_instructions_inner(
+                    input_mint,
+                    output_mint,
+                    amount,
+                    false, // try non-direct
+                    slippage_bps,
+                    price_impact_limit,
+                    user_public_key,
+                    rpc_client,
+                    accounts,
+                    accounts_count_buffer,
+                )
+                .await;
+
+                if let Ok(non_direct_swap) = non_direct_result {
+                    if !non_direct_swap.route.address_lookup_tables.is_empty() {
+                        info!(
+                            "Non-direct route has {} ALTs, using it instead",
+                            non_direct_swap.route.address_lookup_tables.len()
+                        );
+                        return Ok(non_direct_swap);
+                    }
+                }
+                // Fall through to return original direct route result
+            }
+        }
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_best_swap_instructions_inner(
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount: u64,
+    only_direct_routes: bool,
+    slippage_bps: Option<u16>,
+    price_impact_limit: Option<f32>,
+    user_public_key: Pubkey,
+    rpc_client: &RpcClient,
+    accounts: Option<&Vec<&Pubkey>>,
+    accounts_count_buffer: Option<usize>,
+) -> RoutingResult<SwapResult> {
     let accounts_count_buffer = accounts_count_buffer.unwrap_or(0);
     let mut extra_accounts_buffer = EXTRA_ACCOUNTS_BUFFER;
 
@@ -89,79 +160,129 @@ pub async fn get_best_swap_instructions(
             .saturating_sub(accounts_count_buffer);
 
         info!(
-            "Trying swap route with max_accounts={} (buffer={})",
-            max_accounts, extra_accounts_buffer
+            "Trying swap route with max_accounts={} (buffer={}) direct_only={}",
+            max_accounts, extra_accounts_buffer, only_direct_routes
         );
 
-        // First check if we can get a valid quote with these constraints
-        let best_route = match get_best_swap_route(
+        // Get quote and swap instructions from Metis
+        let result = metis::get_quote_and_swap_instructions(
             input_mint,
             output_mint,
             amount,
-            only_direct_routes,
             slippage_bps,
-            price_impact_limit,
-            Some(max_accounts.try_into().unwrap()),
-            user_public_key,
+            if only_direct_routes { Some(true) } else { None },
+            Some(max_accounts.try_into().unwrap_or(64)),
+            &user_public_key,
         )
-        .await
-        {
-            Ok(res) => {
-                info!("Got route: in={} out={}", res.in_amount, res.out_amount);
-                Some(res)
-            }
-            Err(e) => {
-                info!("No route found: {:?}", e);
-                None
-            }
-        };
+        .await;
 
-        if let Some(route) = best_route {
-            info!("Getting swap instructions...");
-            // Get the actual swap instructions
-            let instructions_result = titan::get_swap_instructions(
-                input_mint,
-                output_mint,
-                amount,
-                slippage_bps,
-                user_public_key,
-            )
-            .await;
+        match result {
+            Ok((quote, swap_ixs)) => {
+                // Validate price impact
+                let route_price_impact_pct = if quote.price_impact_pct.is_empty() {
+                    0.0
+                } else {
+                    quote.price_impact_pct.parse::<f32>().unwrap_or(0.0)
+                };
+                if let Some(limit) = price_impact_limit {
+                    if route_price_impact_pct > limit {
+                        info!("Price impact {} exceeds limit {}", route_price_impact_pct, limit);
+                        extra_accounts_buffer += 2;
+                        continue;
+                    }
+                }
 
-            if let Ok(mut decompiled_tx) = instructions_result {
-                info!("Got {} swap instructions", decompiled_tx.instructions.len());
-                let total_accounts = decompiled_tx
-                    .instructions
+                info!("Got route: in={} out={}", quote.in_amount, quote.out_amount);
+
+                // Convert Metis instructions to Solana instructions
+                let mut instructions: Vec<Instruction> = Vec::new();
+
+                // Add compute budget instructions (Metis handles this for us)
+                for ix_data in &swap_ixs.compute_budget_instructions {
+                    match ix_data.to_instruction() {
+                        Ok(ix) => instructions.push(ix),
+                        Err(e) => warn!("Failed to parse compute budget instruction: {}", e),
+                    }
+                }
+
+                // Add setup instructions (token account creation)
+                for ix_data in &swap_ixs.setup_instructions {
+                    match ix_data.to_instruction() {
+                        Ok(ix) => instructions.push(ix),
+                        Err(e) => warn!("Failed to parse setup instruction: {}", e),
+                    }
+                }
+
+                // Add main swap instruction
+                let swap_ix = swap_ixs.swap_instruction.to_instruction()
+                    .map_err(|e| RoutingError::ApiError(format!("Failed to parse swap instruction: {}", e)))?;
+                instructions.push(swap_ix);
+
+                // Add cleanup instruction if present
+                if let Some(cleanup_data) = &swap_ixs.cleanup_instruction {
+                    match cleanup_data.to_instruction() {
+                        Ok(ix) => instructions.push(ix),
+                        Err(e) => warn!("Failed to parse cleanup instruction: {}", e),
+                    }
+                }
+
+                info!("Got {} swap instructions", instructions.len());
+
+                // Count total accounts
+                let total_accounts = instructions
                     .iter()
                     .flat_map(|ix| ix.accounts.iter().map(|a| &a.pubkey))
                     .chain(accounts_distinct.iter().copied())
                     .collect::<HashSet<_>>();
+
                 if total_accounts.len() <= MAX_ACCOUNTS_PER_TRANSACTION {
-                    info!("max accounts {}", max_accounts);
+                    info!("Total accounts: {} (max {})", total_accounts.len(), MAX_ACCOUNTS_PER_TRANSACTION);
 
-                    // Fetch lookup tables from Titan's response
-                    info!("Titan returned {} lookup table addresses", route.address_lookup_tables.len());
-                    if !route.address_lookup_tables.is_empty() {
-                        info!("Fetching swap lookup tables: {:?}", route.address_lookup_tables);
-                        let swap_luts = fetch_lookup_tables(rpc_client, &route.address_lookup_tables).await;
-                        info!("Fetched {} swap lookup tables", swap_luts.len());
-                        if !swap_luts.is_empty() {
-                            decompiled_tx.lookup_tables = Some(swap_luts);
-                        }
-                    }
+                    // Parse ALT addresses from response
+                    let alt_addresses: Vec<Pubkey> = swap_ixs.address_lookup_table_addresses
+                        .iter()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
 
-                    return Ok(SwapResult { route, tx: decompiled_tx });
+                    info!("Metis returned {} lookup table addresses", alt_addresses.len());
+
+                    // Fetch lookup tables from RPC
+                    let lookup_tables = if !alt_addresses.is_empty() {
+                        info!("Fetching swap lookup tables: {:?}", alt_addresses);
+                        let tables = fetch_lookup_tables(rpc_client, &alt_addresses).await;
+                        info!("Fetched {} swap lookup tables", tables.len());
+                        if tables.is_empty() { None } else { Some(tables) }
+                    } else {
+                        None
+                    };
+
+                    let route = SwapRoute {
+                        in_amount: quote.in_amount_u64(),
+                        out_amount: quote.out_amount_u64(),
+                        slippage_bps: quote.slippage_bps,
+                        price_impact_pct: quote.price_impact_pct.clone(),
+                        address_lookup_tables: alt_addresses,
+                    };
+
+                    let tx = DecompiledVersionedTx {
+                        instructions,
+                        lookup_tables,
+                    };
+
+                    return Ok(SwapResult { route, tx });
                 }
+                info!("Too many accounts: {} > {}", total_accounts.len(), MAX_ACCOUNTS_PER_TRANSACTION);
             }
-        } else {
-            warn!("cannot find route from {input_mint} to {output_mint} for max_accounts {max_accounts}");
-            return Err(TitanError::NoValidRoute);
+            Err(e) => {
+                info!("No route found: {:?}", e);
+                return Err(RoutingError::ApiError(e.to_string()));
+            }
         }
 
         extra_accounts_buffer += 2;
     }
 
-    Err(TitanError::NoValidRoute)
+    Err(RoutingError::NoValidRoute)
 }
 
 /// Fetch lookup table accounts from RPC given their addresses

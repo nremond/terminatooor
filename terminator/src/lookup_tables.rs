@@ -7,15 +7,13 @@ use crate::liquidator::Liquidator;
 
 /// Collect keys for the lookup table.
 ///
-/// We prioritize accounts that are most commonly used:
-/// 1. All reserve pubkeys (needed for refresh instructions)
-/// 2. All reserve vaults and mints (needed for token operations)
-/// 3. Liquidator's ATAs (needed for transfers)
-/// 4. Lending market info
+/// We include only keys relevant to THIS market:
+/// 1. Reserve pubkeys (needed for refresh instructions)
+/// 2. Liquidator's ATAs for mints in this market only
+/// 3. Lending market info
 ///
-/// With 55 reserves * 6 accounts + 110 ATAs + overhead = 440+ keys,
-/// we exceed the 256 limit. So we only include reserve pubkeys and vaults
-/// for the most important reserves, plus all liquidator ATAs.
+/// By only including ATAs for this market's reserves (not all 167 ATAs),
+/// we keep the key count well under 256.
 pub fn collect_keys(
     reserves: &HashMap<Pubkey, Reserve>,
     liquidator: &Liquidator,
@@ -24,22 +22,29 @@ pub fn collect_keys(
     let mut lending_markets = HashSet::new();
     let mut keys = HashSet::new();
 
-    // Add all reserve pubkeys (needed for refresh instructions) - ~55 keys
+    // Add all reserve pubkeys (needed for refresh instructions)
     for (pubkey, reserve) in reserves {
         keys.insert(*pubkey);
         lending_markets.insert(reserve.lending_market);
     }
 
-    // Add liquidator ATAs only (not mints - they're included in reserve data)
-    // This is ~110 keys for the ATAs
+    // Add liquidator ATAs only for mints in THIS market's reserves
+    // This is ~2 ATAs per reserve (liquidity + collateral mint)
     {
         let atas = liquidator.atas.read().unwrap();
-        for (_mint, ata) in atas.iter() {
-            keys.insert(*ata);
+        for (_pubkey, reserve) in reserves {
+            // Add ATA for liquidity mint (the actual token)
+            if let Some(ata) = atas.get(&reserve.liquidity.mint_pubkey) {
+                keys.insert(*ata);
+            }
+            // Add ATA for collateral mint (cToken) - needed for some operations
+            if let Some(ata) = atas.get(&reserve.collateral.mint_pubkey) {
+                keys.insert(*ata);
+            }
         }
     }
 
-    // Add lending market info - ~5 keys
+    // Add lending market info
     keys.insert(lending_market.lending_market_owner);
     keys.insert(lending_market.risk_council);
 
@@ -50,6 +55,6 @@ pub fn collect_keys(
         keys.insert(lending_market_authority);
     }
 
-    // Total should be around 170 keys, well under 256
+    // Total: reserves + (2 ATAs per reserve) + market info = much less than 256
     keys
 }

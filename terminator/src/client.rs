@@ -210,7 +210,16 @@ impl KlendClient {
     }
 
     /// Load all lookup table mappings from the JSON file
+    /// Only loads if tables haven't been loaded yet (skips if already in memory)
     async fn load_lookup_tables_from_file(&self) -> Result<()> {
+        // Skip if already loaded - check if we have any tables in memory
+        {
+            let tables = self.lookup_tables.read().unwrap();
+            if !tables.is_empty() {
+                return Ok(());
+            }
+        }
+
         let filename = Self::get_lookup_tables_filename();
 
         if !std::path::Path::new(&filename).exists() {

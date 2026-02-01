@@ -145,6 +145,15 @@ Per-market lookup tables to reduce transaction size:
 - **Cached in memory** after initial load - no RPC calls during liquidation
 - Periodic refresh skips ALT extension to avoid blocking the hot path
 
+### 8. Liquidation Orchestrator (`parallel.rs`)
+Manages liquidation attempts with deduplication and cooldown:
+- **Deduplication**: Prevents attempting same obligation twice simultaneously
+- **Cooldown tracking**: Enforces wait period between attempts on same obligation
+- **Rate limiting**: Semaphore-based concurrency control
+- **Structured logging**: Unique task IDs for filtering logs (`[T42:8xBnR5kd]`)
+- **Error classification**: Categorizes errors as Permanent/Retryable/Unknown
+- **Pure functions**: Core logic testable without I/O
+
 ## Reserve Refresh Requirements
 
 Before liquidating, ALL reserves referenced by an obligation must be refreshed in the same slot:
@@ -256,7 +265,22 @@ Configurable via `--state-refresh-hours` or `STATE_REFRESH_HOURS` env var.
 
 ## Liquidation Orchestrator (`parallel.rs`)
 
-The bot includes an orchestrator module for managing liquidation attempts:
+The bot includes an orchestrator module for managing liquidation attempts with deduplication, cooldown tracking, and structured logging.
+
+### Architecture
+
+```
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│  Geyser Stream  │────>│  LiquidationOrch.    │────>│  liquidate_fast │
+│  (obligations)  │     │  (dedup + cooldown)  │     │  (sequential)   │
+└─────────────────┘     └──────────────────────┘     └─────────────────┘
+                                  │
+                                  v
+                        ┌──────────────────────┐
+                        │  InFlightTracker     │
+                        │  (prevents duplicates)│
+                        └──────────────────────┘
+```
 
 ### Features
 
@@ -264,6 +288,71 @@ The bot includes an orchestrator module for managing liquidation attempts:
 2. **Cooldown Tracking**: Enforces a wait period after each attempt (default: 5 seconds)
 3. **Rate Limiting**: Semaphore-based limit on concurrent attempts (default: 5)
 4. **Structured Logging**: Each attempt gets a unique task ID for filtering logs
+5. **Error Classification**: Categorizes errors for appropriate handling
+6. **Pure Functions**: Core logic in testable pure functions
+
+### Data Types
+
+**LiquidationRequest** - Input data for a liquidation attempt:
+```rust
+struct LiquidationRequest {
+    task_id: u64,              // Unique identifier for logging
+    obligation_pubkey: Pubkey, // The obligation to liquidate
+    obligation: Obligation,    // Deserialized obligation data
+    market_pubkey: Pubkey,     // Which market this belongs to
+    ltv: Fraction,             // Current LTV ratio
+    unhealthy_ltv: Fraction,   // Threshold for liquidation
+    ltv_margin_pct: f64,       // How far over threshold (e.g., 0.05 = 5%)
+    slot: u64,                 // Slot when observed
+    created_at: Instant,       // For latency tracking
+}
+```
+
+**LiquidationOutcome** - Result of an attempt:
+```rust
+enum LiquidationOutcome {
+    Success { task_id, obligation, duration_ms, profit_estimate },
+    RetryableError { task_id, obligation, error, duration_ms },
+    PermanentError { task_id, obligation, error, duration_ms },
+    Skipped { task_id, obligation, reason },
+}
+```
+
+### InFlightTracker
+
+Tracks which obligations are currently being processed:
+
+```rust
+struct InFlightTracker {
+    in_flight: RwLock<HashSet<Pubkey>>,  // Currently processing
+    recent: Arc<RwLock<HashSet<Pubkey>>>, // In cooldown period
+    cooldown: Duration,                   // How long to wait after attempt
+}
+```
+
+**Methods:**
+- `try_acquire(pubkey)` - Returns true if slot acquired, false if already in-flight or cooldown
+- `release(pubkey)` - Releases slot and starts cooldown timer
+- `can_process(pubkey)` - Check without acquiring (for pre-filtering)
+
+### Pure Functions (Testable)
+
+The module uses pure functions for core logic to enable unit testing:
+
+```rust
+// Check if obligation should be skipped
+fn should_skip_liquidation(
+    pubkey: &Pubkey,
+    in_flight: &HashSet<Pubkey>,
+    recent: &HashSet<Pubkey>,
+) -> Option<String>  // Returns skip reason or None
+
+// Classify error for retry decisions
+fn classify_error(error: &str) -> ErrorClassification
+
+// Format log prefix for consistent logging
+fn log_prefix(task_id: u64, obligation: &Pubkey) -> String
+```
 
 ### Task ID Format
 
@@ -273,24 +362,76 @@ Logs use the format `[T{task_id}:{obligation_short}]` for easy grep/filtering:
 [T42:8xBnR5kd] ✓ Liquidation completed
 ```
 
+Filter logs for a specific task: `grep "\[T42:" logs.txt`
+
 ### Error Classification
 
 Errors are classified to determine retry behavior:
 
 | Classification | Examples | Behavior |
 |----------------|----------|----------|
-| **Permanent** | ObligationHealthy, TOKEN_NOT_TRADABLE, InsufficientLiquidity | Don't retry |
-| **Retryable** | SlippageToleranceExceeded (0x1788), ReserveStale, BlockhashNotFound | Can retry after cooldown |
-| **Unknown** | Other errors | Logged for investigation |
+| **Permanent** | `ObligationHealthy`, `TOKEN_NOT_TRADABLE`, `InsufficientLiquidity` | Don't retry |
+| **Retryable** | `SlippageToleranceExceeded` (0x1788), `ReserveStale`, `BlockhashNotFound`, `timeout` | Can retry after cooldown |
+| **Unknown** | Other errors | Logged for investigation, treated as retryable once |
+
+### Log Symbols
+
+| Symbol | Meaning |
+|--------|---------|
+| `✓` | Success |
+| `✗` | Permanent error (won't retry) |
+| `⟳` | Retryable error (may retry after cooldown) |
+| `?` | Unknown error (logged for investigation) |
+| `⚠` | Panic caught (klend library issue) |
 
 ### Configuration
 
-- `--max-concurrent` / `MAX_CONCURRENT_LIQUIDATIONS`: Max parallel attempts (default: 5)
-- `--cooldown-secs` / `LIQUIDATION_COOLDOWN_SECS`: Wait after each attempt (default: 5)
+| Option | Environment Variable | Default | Description |
+|--------|---------------------|---------|-------------|
+| `--max-concurrent` | `MAX_CONCURRENT_LIQUIDATIONS` | 5 | Max simultaneous liquidation attempts |
+| `--cooldown-secs` | `LIQUIDATION_COOLDOWN_SECS` | 5 | Seconds to wait before retrying same obligation |
+
+### Orchestrator Flow
+
+```
+1. Geyser detects liquidatable obligation
+2. orchestrator.try_start(pubkey) called
+   ├─ If in_flight or cooldown → return None (skip)
+   └─ If available → acquire slot, return (task_id, permit)
+3. Execute liquidate_fast()
+4. Log result with task_id prefix
+5. orchestrator.finish(pubkey) releases slot, starts cooldown
+6. After cooldown_secs, obligation can be attempted again
+```
+
+### Statistics
+
+The orchestrator provides monitoring stats:
+
+```rust
+struct OrchestratorStats {
+    in_flight: usize,        // Currently processing
+    cooldown: usize,         // In cooldown period
+    available_permits: usize, // Remaining capacity
+    max_concurrent: usize,   // Configured limit
+    total_submitted: u64,    // Lifetime counter
+}
+```
+
+Display format: `Liquidations: 2/5 active, 3 cooldown, 47 total`
 
 ### Why Not True Parallelism?
 
-The Kamino lending library uses `Rc<RefCell<>>` for internal state management, which is not thread-safe (`!Send`). This means liquidation futures cannot be spawned across threads with `tokio::spawn`. The orchestrator still provides value by preventing duplicate attempts and enforcing cooldowns between attempts on the same obligation.
+The Kamino lending library uses `Rc<RefCell<>>` for internal state management, which is not thread-safe (`!Send`). This means liquidation futures cannot be spawned across threads with `tokio::spawn`.
+
+**What this means:**
+- Liquidations execute sequentially on the main thread
+- The orchestrator still provides deduplication and cooldown tracking
+- Multiple liquidatable obligations discovered simultaneously won't cause duplicate attempts
+
+**What would be needed for true parallelism:**
+- Kamino library would need to use `Arc<Mutex<>>` instead of `Rc<RefCell<>>`
+- This is outside our control as it's in the external `kamino_lending` crate
 
 ## Configuration
 

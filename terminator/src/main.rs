@@ -1078,10 +1078,18 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             {
                 Ok(result) => result,
                 Err(e) => {
-                    warn!(
-                        "No swap route found from {} to {}: {:?}, skipping liquidation",
-                        coll_mint, debt_mint, e
-                    );
+                    let err_str = format!("{:?}", e);
+                    if err_str.contains("TOKEN_NOT_TRADABLE") {
+                        warn!(
+                            "Collateral {} is an LP/kToken (not tradable on DEX), skipping flash loan liquidation",
+                            coll_mint
+                        );
+                    } else {
+                        warn!(
+                            "No swap route found from {} to {}: {:?}, skipping liquidation",
+                            coll_mint, debt_mint, e
+                        );
+                    }
                     return Ok(());
                 }
             };
@@ -1525,10 +1533,18 @@ async fn liquidate_fast(
             {
                 Ok(result) => result,
                 Err(e) => {
-                    warn!(
-                        "No swap route found from {} to {}: {:?}, skipping liquidation",
-                        coll_mint, debt_mint, e
-                    );
+                    let err_str = format!("{:?}", e);
+                    if err_str.contains("TOKEN_NOT_TRADABLE") {
+                        warn!(
+                            "Collateral {} is an LP/kToken (not tradable on DEX), skipping flash loan liquidation",
+                            coll_mint
+                        );
+                    } else {
+                        warn!(
+                            "No swap route found from {} to {}: {:?}, skipping liquidation",
+                            coll_mint, debt_mint, e
+                        );
+                    }
                     return Ok(());
                 }
             };

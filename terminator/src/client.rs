@@ -704,6 +704,13 @@ impl KlendClient {
                 .unwrap();
 
             let farm = reserve.get_farm(*farm_mode);
+            println!(
+                "Reserve {} ({:?}): farm={} (has_farm={})",
+                reserve_acc.key,
+                farm_mode,
+                farm,
+                farm != Pubkey::default()
+            );
 
             // 5.1 Build Refresh Obligation Farms
             if farm != Pubkey::default() {
@@ -725,6 +732,13 @@ impl KlendClient {
                 }
             }
         }
+
+        println!(
+            "wrap_obligation_instruction_with_farms: {} pre_ixs, {} post_ixs (skip_post={})",
+            pre_instructions.len(),
+            post_instructions.len(),
+            skip_post_farm_refresh
+        );
 
         (pre_instructions, post_instructions)
     }

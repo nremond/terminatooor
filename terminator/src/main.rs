@@ -10,13 +10,13 @@ use consts::WRAPPED_SOL_MINT;
 use itertools::Itertools;
 use crate::routing::DecompiledVersionedTx;
 use bytemuck::try_from_bytes;
-use kamino_lending::{Obligation, Reserve};
+use kamino_lending::{LendingMarket, Obligation, Reserve, ReserveFarmKind};
 use solana_sdk::{
     compute_budget::{self},
     signer::Signer,
 };
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 
 use crate::{
@@ -193,6 +193,22 @@ pub enum Actions {
         #[clap(flatten)]
         rebalance_args: RebalanceArgs,
     },
+
+    /// Test flash loan liquidation by simulating a transaction for a specific obligation
+    /// This is useful for debugging error 2502 without waiting for real opportunities
+    #[clap()]
+    TestFlashLiquidation {
+        /// Obligation to test liquidation against (optional - will fetch one if not provided)
+        #[clap(long, env, parse(try_from_str))]
+        obligation: Option<Pubkey>,
+
+        /// Market pubkey (optional, will be derived from obligation if not provided)
+        #[clap(long, env, parse(try_from_str))]
+        market: Option<Pubkey>,
+
+        #[clap(flatten)]
+        rebalance_args: RebalanceArgs,
+    },
 }
 
 #[tokio::main]
@@ -246,7 +262,360 @@ async fn main() -> Result<()> {
             rebalance_args: _,
         } => swap::swap_action(&klend_client, from, to, amount, slippage_pct).await,
         Actions::Rebalance { rebalance_args: _ } => rebalance(&klend_client).await,
+        Actions::TestFlashLiquidation {
+            obligation,
+            market,
+            rebalance_args: _,
+        } => test_flash_liquidation(&klend_client, obligation.as_ref(), market.as_ref()).await,
     }
+}
+
+/// Test flash loan liquidation by building and simulating a transaction
+/// This helps debug error 2502 without waiting for real liquidation opportunities
+async fn test_flash_liquidation(
+    klend_client: &Arc<KlendClient>,
+    obligation_pubkey: Option<&Pubkey>,
+    market_pubkey: Option<&Pubkey>,
+) -> Result<()> {
+    use base64::engine::general_purpose::STANDARD as BS64;
+    use base64::Engine;
+    use solana_sdk::compute_budget;
+
+    info!("=== Testing Flash Loan Liquidation ===");
+
+    // If no obligation provided, fetch markets and find one with deposits and borrows
+    let (obligation_pubkey, obligation, market_key) = if let Some(ob_key) = obligation_pubkey {
+        info!("Obligation: {}", ob_key);
+        let obligation: Obligation = klend_client
+            .client
+            .get_anchor_account(ob_key)
+            .await?;
+        let market_key = market_pubkey.copied().unwrap_or(obligation.lending_market);
+        (*ob_key, obligation, market_key)
+    } else {
+        info!("No obligation provided, searching for one with deposits and borrows...");
+
+        // Fetch all markets
+        let markets = klend_client.fetch_all_markets().await?;
+        info!("Found {} markets", markets.len());
+
+        let mut found_obligation = None;
+        for market in markets.iter().take(3) {  // Check first 3 markets
+            info!("Checking market {}...", market);
+            match klend_client.fetch_obligations(market).await {
+                Ok(obligations) => {
+                    info!("Found {} obligations in market", obligations.len());
+                    // Find obligation with both deposits and borrows
+                    for (pubkey, ob) in obligations.iter().take(100) {  // Check first 100
+                        let has_deposits = ob.deposits.iter().any(|d| d.deposit_reserve != Pubkey::default() && d.deposited_amount > 0);
+                        let has_borrows = ob.borrows.iter().any(|b| b.borrow_reserve != Pubkey::default() && b.borrowed_amount_sf > 0);
+                        if has_deposits && has_borrows {
+                            info!("Found suitable obligation: {}", pubkey);
+                            found_obligation = Some((*pubkey, ob.clone(), *market));
+                            break;
+                        }
+                    }
+                    if found_obligation.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch obligations for market {}: {:?}", market, e);
+                }
+            }
+        }
+
+        found_obligation.ok_or_else(|| anyhow::anyhow!("No suitable obligation found"))?
+    };
+
+    info!("Using obligation: {}", obligation_pubkey);
+    info!("Market: {}", market_key);
+
+    // Load market and reserves
+    info!("Loading market and reserves...");
+    let market_accounts = klend_client.fetch_market_and_reserves(&market_key).await?;
+    let lending_market = StateWithKey::new(market_accounts.lending_market, market_key);
+    let reserves = &market_accounts.reserves;
+    info!("Found {} reserves", reserves.len());
+
+    // Load lookup table for this market (required for transaction size reduction)
+    info!("Loading lookup table for market...");
+    klend_client.load_lookup_table(&market_key, &market_accounts).await?;
+
+    // Find deposits and borrows
+    let deposits: Vec<_> = obligation
+        .deposits
+        .iter()
+        .filter(|d| d.deposit_reserve != Pubkey::default() && d.deposited_amount > 0)
+        .collect();
+    let borrows: Vec<_> = obligation
+        .borrows
+        .iter()
+        .filter(|b| b.borrow_reserve != Pubkey::default() && b.borrowed_amount_sf > 0)
+        .collect();
+
+    info!("Obligation has {} deposits and {} borrows", deposits.len(), borrows.len());
+
+    if deposits.is_empty() || borrows.is_empty() {
+        info!("No deposits or borrows found, cannot simulate liquidation");
+        return Ok(());
+    }
+
+    // Print deposit/borrow details
+    for deposit in &deposits {
+        info!("  Deposit: reserve={} amount={}", deposit.deposit_reserve, deposit.deposited_amount);
+    }
+    for borrow in &borrows {
+        let borrowed: u64 = (borrow.borrowed_amount_sf >> 60) as u64; // Approximate conversion from sf
+        info!("  Borrow: reserve={} amount_sf={} (~{})", borrow.borrow_reserve, borrow.borrowed_amount_sf, borrowed);
+    }
+
+    // Use first deposit as collateral and first borrow as debt
+    let coll_reserve_key = deposits[0].deposit_reserve;
+    let debt_reserve_key = borrows[0].borrow_reserve;
+
+    let coll_reserve_data: Reserve = reserves
+        .get(&coll_reserve_key)
+        .ok_or_else(|| anyhow::anyhow!("Collateral reserve not found"))?
+        .clone();
+    let debt_reserve_data: Reserve = reserves
+        .get(&debt_reserve_key)
+        .ok_or_else(|| anyhow::anyhow!("Debt reserve not found"))?
+        .clone();
+
+    let coll_reserve = StateWithKey::new(coll_reserve_data.clone(), coll_reserve_key);
+    let debt_reserve = StateWithKey::new(debt_reserve_data.clone(), debt_reserve_key);
+
+    info!("Using collateral reserve: {}", coll_reserve_key);
+    info!("Using debt reserve: {}", debt_reserve_key);
+
+    // Check farm configuration
+    let coll_farm = coll_reserve_data.get_farm(ReserveFarmKind::Collateral);
+    let debt_farm = debt_reserve_data.get_farm(ReserveFarmKind::Debt);
+    info!("Collateral reserve farm (Collateral mode): {} (has_farm={})", coll_farm, coll_farm != Pubkey::default());
+    info!("Debt reserve farm (Debt mode): {} (has_farm={})", debt_farm, debt_farm != Pubkey::default());
+
+    // Ensure ATAs exist for all reserve mints before building instructions
+    info!("Ensuring ATAs for reserves...");
+    klend_client
+        .liquidator
+        .ensure_atas_for_reserves(klend_client, reserves)
+        .await?;
+
+    // Calculate a small test liquidation amount (1% of borrowed amount or 1 token)
+    let borrowed_sf = borrows[0].borrowed_amount_sf;
+    let borrowed_amount: u64 = (borrowed_sf >> 60) as u64;
+    let liquidate_amount = std::cmp::max(borrowed_amount / 100, 1000); // At least 1000 base units
+    info!("Test liquidation amount: {}", liquidate_amount);
+
+    // Get debt token ATA
+    let debt_mint = debt_reserve_data.liquidity.mint_pubkey;
+    let coll_mint = coll_reserve_data.liquidity.mint_pubkey;
+    info!("Debt mint: {}", debt_mint);
+    info!("Collateral mint: {}", coll_mint);
+
+    let debt_token_ata = {
+        let atas = klend_client.liquidator.atas.read().unwrap();
+        match atas.get(&debt_mint) {
+            Some(ata) => *ata,
+            None => {
+                info!("No ATA for debt token, using derived address");
+                spl_associated_token_account::get_associated_token_address(
+                    &klend_client.liquidator.wallet.pubkey(),
+                    &debt_mint,
+                )
+            }
+        }
+    };
+
+    // Build flash loan liquidation transaction
+    info!("\n=== Building Flash Loan Liquidation Transaction ===");
+
+    let mut ixns = vec![];
+    let mut luts = vec![];
+
+    // 1. Flash borrow
+    let debt_token_program = klend_client.liquidator.token_program_for_mint(&debt_mint);
+    let flash_borrow_ix = instructions::flash_borrow_reserve_liquidity_ix(
+        &klend_client.program_id,
+        &lending_market.key,
+        &debt_reserve,
+        &debt_token_ata,
+        &klend_client.liquidator,
+        liquidate_amount,
+        None,
+        None,
+        debt_token_program,
+    );
+    ixns.push(flash_borrow_ix.instruction);
+    let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
+
+    // 2. Liquidation instructions
+    let obligation_for_ix = StateWithKey::new(obligation.clone(), obligation_pubkey);
+    info!("Building liquidation instructions with skip_post_farm_refresh=false...");
+    let liquidate_ixns = klend_client
+        .liquidate_obligation_and_redeem_reserve_collateral_ixns(
+            lending_market.clone(),
+            debt_reserve.clone(),
+            coll_reserve.clone(),
+            obligation_for_ix.clone(),
+            liquidate_amount,
+            0, // min_acceptable_received_coll_amount
+            None, // max_allowed_ltv_override
+            false, // skip_post_farm_refresh = false (include post-farm refresh)
+        )
+        .await?;
+
+    info!("Liquidation instructions count: {}", liquidate_ixns.len());
+    ixns.extend_from_slice(&liquidate_ixns);
+
+    // 3. Swap instructions (if collateral != debt)
+    // Skip swap for this test if METIS_ENDPOINT is not configured
+    let _expected_collateral = liquidate_amount; // Simplified estimate
+    if coll_mint != debt_mint && std::env::var("METIS_ENDPOINT").is_ok() {
+        info!("Getting swap instructions: {} -> {}", coll_mint, debt_mint);
+        let user = klend_client.liquidator.wallet.pubkey();
+        let swap_result = get_best_swap_instructions(
+            &coll_mint,
+            &debt_mint,
+            _expected_collateral,
+            true, // only_direct_routes
+            Some(100), // slippage_bps
+            Some(5.0), // price_impact_limit
+            user,
+            &klend_client.client.client,
+            None,
+            None,
+        )
+        .await;
+
+        match swap_result {
+            Ok(result) => {
+                let SwapResult { route: _, tx: swap_tx } = result;
+                let DecompiledVersionedTx {
+                    lookup_tables,
+                    instructions: swap_ixs,
+                } = swap_tx;
+
+                // Filter compute budget ixns
+                let swap_ixs: Vec<_> = swap_ixs
+                    .into_iter()
+                    .filter(|ix| ix.program_id != compute_budget::id())
+                    .collect();
+
+                info!("Swap instructions count: {}", swap_ixs.len());
+                ixns.extend_from_slice(&swap_ixs);
+
+                if let Some(lookup_tables) = lookup_tables {
+                    for table in lookup_tables.into_iter() {
+                        luts.push(table);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("No swap route found: {:?}, proceeding without swap", e);
+            }
+        }
+    } else if coll_mint != debt_mint {
+        warn!("Skipping swap (METIS_ENDPOINT not configured) - this test will show instruction order but won't be executable");
+    }
+
+    // 4. Flash repay
+    let flash_repay_ix = instructions::flash_repay_reserve_liquidity_ix(
+        &klend_client.program_id,
+        &lending_market.key,
+        &debt_reserve,
+        &debt_token_ata,
+        &klend_client.liquidator,
+        liquidate_amount,
+        flash_borrow_index,
+        None,
+        None,
+        debt_token_program,
+    );
+    ixns.push(flash_repay_ix.instruction);
+
+    // Print instruction order
+    info!("\n=== Transaction Instruction Order (before ComputeBudget prepend) ===");
+    for (i, ix) in ixns.iter().enumerate() {
+        let program_name = if ix.program_id == klend_client.program_id {
+            "Kamino".to_string()
+        } else if ix.program_id == solana_sdk::system_program::id() {
+            "System".to_string()
+        } else if ix.program_id == anchor_spl::token::ID {
+            "Token".to_string()
+        } else if ix.program_id == anchor_spl::token_2022::ID {
+            "Token2022".to_string()
+        } else if ix.program_id == spl_associated_token_account::ID {
+            "ATA".to_string()
+        } else if ix.program_id == compute_budget::id() {
+            "ComputeBudget".to_string()
+        } else {
+            format!("{}...", &ix.program_id.to_string()[..8])
+        };
+        info!("  [{}] {} ({}) - {} accounts", i, program_name, ix.program_id, ix.accounts.len());
+    }
+
+    // Identify key positions
+    let flash_borrow_pos = 0;
+    let liquidate_pos = liquidate_ixns.iter().position(|ix| {
+        // Liquidate instruction has a specific discriminator
+        ix.data.len() >= 8
+    }).map(|p| p + 1); // +1 for flash_borrow
+    info!("\nKey positions (before ComputeBudget):");
+    info!("  flash_borrow: {}", flash_borrow_pos);
+    info!("  liquidate_ixns start: 1");
+    info!("  liquidate_ixns count: {}", liquidate_ixns.len());
+
+    // Build transaction
+    info!("\n=== Building Transaction ===");
+    let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
+
+    // Add lookup tables
+    if let Some(liquidator_lut) = klend_client.get_lookup_table(&lending_market.key) {
+        info!("Adding liquidator lookup table with {} addresses", liquidator_lut.addresses.len());
+        txn = txn.add_lookup_table(liquidator_lut);
+    }
+    for lut in luts {
+        txn = txn.add_lookup_table(lut);
+    }
+
+    let txn = txn.build_with_budget_and_fee(&[]).await?;
+
+    // Check transaction size
+    let txn_bytes = bincode::serialize(&txn).unwrap_or_default();
+    let txn_size = txn_bytes.len();
+    info!("Transaction size: {} bytes ({:.1}% of 1232 max)", txn_size, (txn_size as f64 / 1232.0) * 100.0);
+
+    let txn_b64 = BS64.encode(&txn_bytes);
+    info!("Simulation URL: https://explorer.solana.com/tx/inspector?message={}", urlencoding::encode(&txn_b64));
+
+    // Simulate
+    info!("\n=== Simulating Transaction ===");
+    let res = klend_client.client.client.simulate_transaction(&txn).await;
+
+    match res {
+        Ok(sim_result) => {
+            if let Some(err) = sim_result.value.err {
+                error!("Simulation FAILED: {:?}", err);
+                if let Some(logs) = sim_result.value.logs {
+                    info!("Simulation logs:");
+                    for log in logs {
+                        info!("  {}", log);
+                    }
+                }
+            } else {
+                info!("Simulation SUCCEEDED!");
+                info!("Compute units used: {:?}", sim_result.value.units_consumed);
+            }
+        }
+        Err(e) => {
+            error!("Simulation request failed: {:?}", e);
+        }
+    }
+
+    info!("\n=== Test Complete ===");
+    Ok(())
 }
 
 async fn rebalance(klend_client: &Arc<KlendClient>) -> Result<()> {
@@ -783,6 +1152,28 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             expected_collateral
         );
 
+        // Debug: print instruction program IDs to diagnose error 2502
+        // After ComputeBudget ixs are prepended, the final order will be:
+        // [0] SetComputeUnitLimit, [1] SetComputeUnitPrice, [2+] our instructions
+        info!("Transaction instruction order (before ComputeBudget prepend):");
+        for (i, ix) in ixns.iter().enumerate() {
+            let program_name = if ix.program_id == klend_client.program_id {
+                "Kamino".to_string()
+            } else if ix.program_id == solana_sdk::system_program::id() {
+                "System".to_string()
+            } else if ix.program_id == anchor_spl::token::ID {
+                "Token".to_string()
+            } else if ix.program_id == anchor_spl::token_2022::ID {
+                "Token2022".to_string()
+            } else if ix.program_id == spl_associated_token_account::ID {
+                "ATA".to_string()
+            } else {
+                format!("{}...", &ix.program_id.to_string()[..8])
+            };
+            info!("  [{}] {} ({})", i, program_name, ix.program_id);
+        }
+        info!("  Note: liquidate_ixns count = {}", liquidate_ixns.len());
+
         // Build transaction with lookup tables
         let swap_luts_count = luts.len();
         let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
@@ -1207,6 +1598,26 @@ async fn liquidate_fast(
             repay_amount - liquidate_amount,
             expected_collateral
         );
+
+        // Debug: print instruction program IDs to diagnose error 2502
+        info!("Transaction instruction order (before ComputeBudget prepend):");
+        for (i, ix) in ixns.iter().enumerate() {
+            let program_name = if ix.program_id == klend_client.program_id {
+                "Kamino".to_string()
+            } else if ix.program_id == solana_sdk::system_program::id() {
+                "System".to_string()
+            } else if ix.program_id == anchor_spl::token::ID {
+                "Token".to_string()
+            } else if ix.program_id == anchor_spl::token_2022::ID {
+                "Token2022".to_string()
+            } else if ix.program_id == spl_associated_token_account::ID {
+                "ATA".to_string()
+            } else {
+                format!("{}...", &ix.program_id.to_string()[..8])
+            };
+            info!("  [{}] {} ({})", i, program_name, ix.program_id);
+        }
+        info!("  Note: liquidate_ixns count = {}", liquidate_ixns.len());
 
         // Build transaction with lookup tables
         let swap_luts_count = luts.len();

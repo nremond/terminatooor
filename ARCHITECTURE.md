@@ -254,6 +254,44 @@ Market state is refreshed periodically (default: every 4 hours) to catch:
 
 Configurable via `--state-refresh-hours` or `STATE_REFRESH_HOURS` env var.
 
+## Liquidation Orchestrator (`parallel.rs`)
+
+The bot includes an orchestrator module for managing liquidation attempts:
+
+### Features
+
+1. **Deduplication**: Prevents attempting the same obligation twice simultaneously
+2. **Cooldown Tracking**: Enforces a wait period after each attempt (default: 5 seconds)
+3. **Rate Limiting**: Semaphore-based limit on concurrent attempts (default: 5)
+4. **Structured Logging**: Each attempt gets a unique task ID for filtering logs
+
+### Task ID Format
+
+Logs use the format `[T{task_id}:{obligation_short}]` for easy grep/filtering:
+```
+[T42:8xBnR5kd] Starting liquidation (LTV margin=2.50%)
+[T42:8xBnR5kd] ✓ Liquidation completed
+```
+
+### Error Classification
+
+Errors are classified to determine retry behavior:
+
+| Classification | Examples | Behavior |
+|----------------|----------|----------|
+| **Permanent** | ObligationHealthy, TOKEN_NOT_TRADABLE, InsufficientLiquidity | Don't retry |
+| **Retryable** | SlippageToleranceExceeded (0x1788), ReserveStale, BlockhashNotFound | Can retry after cooldown |
+| **Unknown** | Other errors | Logged for investigation |
+
+### Configuration
+
+- `--max-concurrent` / `MAX_CONCURRENT_LIQUIDATIONS`: Max parallel attempts (default: 5)
+- `--cooldown-secs` / `LIQUIDATION_COOLDOWN_SECS`: Wait after each attempt (default: 5)
+
+### Why Not True Parallelism?
+
+The Kamino lending library uses `Rc<RefCell<>>` for internal state management, which is not thread-safe (`!Send`). This means liquidation futures cannot be spawned across threads with `tokio::spawn`. The orchestrator still provides value by preventing duplicate attempts and enforcing cooldowns between attempts on the same obligation.
+
 ## Configuration
 
 Key environment variables:
@@ -263,6 +301,8 @@ Key environment variables:
 - `TITAN_WS_URL`: Titan aggregator WebSocket URL
 - `WALLET_PATH`: Path to liquidator keypair JSON
 - `STATE_REFRESH_HOURS`: How often to refresh market state (default: 4)
+- `MAX_CONCURRENT_LIQUIDATIONS`: Max concurrent liquidation attempts (default: 5)
+- `LIQUIDATION_COOLDOWN_SECS`: Cooldown between attempts on same obligation (default: 5)
 - `LIQUIDATOR_LOOKUP_TABLE_FILE`: Path to lookup tables JSON (default: `liquidator_lookup_tables.json`)
 
 ## Non-Tradable Collateral (LP Tokens)

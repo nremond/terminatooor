@@ -54,6 +54,7 @@ mod px;
 pub mod sysvars;
 pub mod titan;  // Keep for now, will remove after Metis is confirmed working
 mod utils;
+pub mod parallel;
 
 const USDC_MINT_STR: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -156,6 +157,14 @@ pub enum Actions {
         /// This is a fallback safety check; Geyser provides real-time updates.
         #[clap(long, env = "STATE_REFRESH_HOURS", default_value = "4")]
         state_refresh_hours: u64,
+
+        /// Maximum number of concurrent liquidations. Default: 5.
+        #[clap(long, env = "MAX_CONCURRENT_LIQUIDATIONS", default_value = "5")]
+        max_concurrent: usize,
+
+        /// Cooldown period (seconds) before retrying the same obligation. Default: 5.
+        #[clap(long, env = "LIQUIDATION_COOLDOWN_SECS", default_value = "5")]
+        cooldown_secs: u64,
     },
     #[clap()]
     Liquidate {
@@ -241,14 +250,19 @@ async fn main() -> Result<()> {
             obligation: obligation_filter,
             rebalance_args: _,
         } => crank(&klend_client, obligation_filter).await,
-        Actions::CrankStream { rebalance_args: _, state_refresh_hours } => {
+        Actions::CrankStream { rebalance_args: _, state_refresh_hours, max_concurrent, cooldown_secs } => {
             let geyser_endpoint = args
                 .geyser_endpoint
                 .ok_or_else(|| anyhow::anyhow!("--geyser-endpoint is required for CrankStream"))?;
             let geyser_api_key = args
                 .geyser_api_key
                 .ok_or_else(|| anyhow::anyhow!("--geyser-api-key is required for CrankStream"))?;
-            crank_stream(&klend_client, geyser_endpoint, geyser_api_key, state_refresh_hours).await
+            let parallel_config = parallel::ParallelConfig {
+                max_concurrent,
+                cooldown_duration: Duration::from_secs(cooldown_secs),
+                ..Default::default()
+            };
+            crank_stream(klend_client.clone(), geyser_endpoint, geyser_api_key, state_refresh_hours, parallel_config).await
         }
         Actions::Liquidate {
             obligation,
@@ -1919,15 +1933,19 @@ async fn crank(klend_client: &KlendClient, obligation_filter: Option<Pubkey>) ->
 /// This is significantly faster than RPC polling as it receives updates within ~50-100ms
 /// of on-chain state changes.
 async fn crank_stream(
-    klend_client: &KlendClient,
+    klend_client: Arc<KlendClient>,
     geyser_endpoint: String,
     geyser_api_key: String,
     state_refresh_hours: u64,
+    parallel_config: parallel::ParallelConfig,
 ) -> Result<()> {
-    info!("Starting stream-based crank with Geyser/LaserStream (state refresh every {} hours)", state_refresh_hours);
+    info!(
+        "Starting stream-based crank with Geyser/LaserStream (state refresh every {} hours, max {} concurrent)",
+        state_refresh_hours, parallel_config.max_concurrent
+    );
 
     // Get lending markets to monitor
-    let lending_markets = get_lending_markets(klend_client).await?;
+    let lending_markets = get_lending_markets(&klend_client).await?;
     info!("Monitoring {} markets: {:?}", lending_markets.len(), lending_markets);
 
     // Load initial state for all markets BEFORE connecting to Geyser
@@ -1935,12 +1953,12 @@ async fn crank_stream(
     let mut market_states: HashMap<Pubkey, MarketState> = HashMap::new();
     for market in &lending_markets {
         info!("Loading initial state for market {}", market.to_string().green());
-        match load_market_state(klend_client, market, true).await {
+        match load_market_state(&klend_client, market, true).await {
             Ok(state) => {
                 // Ensure ATAs exist for all reserve mints
                 if let Err(e) = klend_client
                     .liquidator
-                    .ensure_atas_for_reserves(klend_client, &state.reserves)
+                    .ensure_atas_for_reserves(&klend_client, &state.reserves)
                     .await
                 {
                     warn!("Failed to ensure ATAs for market {}: {:?}", market, e);
@@ -1963,6 +1981,10 @@ async fn crank_stream(
     let mut geyser_stream = GeyserStream::connect(geyser_config).await?;
     info!("Connected to Geyser stream");
 
+    // Create the parallel liquidation orchestrator (wrapped in Arc for sharing across tasks)
+    let orchestrator = Arc::new(parallel::LiquidationOrchestrator::new(parallel_config.clone()));
+    info!("Parallel liquidation orchestrator initialized (max_concurrent={})", parallel_config.max_concurrent);
+
     // Track obligations we've seen and their LTVs
     let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
     let mut last_state_refresh = std::time::Instant::now();
@@ -1976,11 +1998,11 @@ async fn crank_stream(
             info!("Refreshing market states (periodic refresh)");
             for market in &lending_markets {
                 // Skip ALT updates during periodic refresh to avoid blocking
-                if let Ok(state) = load_market_state(klend_client, market, false).await {
+                if let Ok(state) = load_market_state(&klend_client, market, false).await {
                     // Ensure ATAs exist for any new reserve mints
                     if let Err(e) = klend_client
                         .liquidator
-                        .ensure_atas_for_reserves(klend_client, &state.reserves)
+                        .ensure_atas_for_reserves(&klend_client, &state.reserves)
                         .await
                     {
                         warn!("Failed to ensure ATAs for market {}: {:?}", market, e);
@@ -2023,7 +2045,7 @@ async fn crank_stream(
 
                     // Evaluate the obligation
                     match evaluate_obligation_streaming(
-                        klend_client,
+                        &klend_client,
                         &obligation_update.pubkey,
                         &obligation,
                         market_state,
@@ -2052,48 +2074,67 @@ async fn crank_stream(
                                     0.0
                                 };
 
-                                // Trigger liquidation (fast path using cached data)
-                                // Wrap with catch_unwind to handle panics from klend library
-                                // (e.g., unsupported price exponents like exp=31)
-                                let liquidation_result = AssertUnwindSafe(liquidate_fast(
-                                    klend_client,
-                                    &obligation_update.pubkey,
-                                    obligation.clone(),
-                                    market_state,
-                                    obligation_update.slot,
-                                    ltv_margin_pct,
-                                )).catch_unwind().await;
+                                // Trigger liquidation with orchestrator for deduplication/cooldown tracking
+                                // Note: true parallelism not possible due to Kamino library using Rc<RefCell>
+                                // but we get: deduplication, cooldown tracking, and structured logging
+                                let obligation_key = obligation_update.pubkey;
+                                let slot = obligation_update.slot;
+                                let short_id = &obligation_key.to_string()[..8];
 
-                                match liquidation_result {
-                                    Ok(Ok(())) => {
-                                        // Liquidation succeeded
-                                    }
-                                    Ok(Err(e)) => {
-                                        // Normal error handling
-                                        let err_str = format!("{:?}", e);
-                                        if err_str.contains("NegativeInterestRate")
-                                            || err_str.contains("ObligationStale")
-                                            || err_str.contains("ReserveStale") {
-                                            info!("Skipping {} (protocol state issue): {}",
-                                                obligation_update.pubkey,
-                                                e.to_string().split("error_msg:").nth(1)
-                                                    .and_then(|s| s.split(',').next())
-                                                    .unwrap_or(&err_str)
-                                            );
-                                        } else {
-                                            warn!("Liquidation failed for {}: {:?}", obligation_update.pubkey, e);
+                                // Check orchestrator for deduplication
+                                match orchestrator.try_start(&obligation_key).await {
+                                    Some((task_id, permit)) => {
+                                        let prefix = format!("[T{}:{}]", task_id, short_id);
+                                        info!("{} Starting liquidation (LTV margin={:.2}%)", prefix, ltv_margin_pct * 100.0);
+
+                                        // Wrap with catch_unwind to handle panics from klend library
+                                        let liquidation_result = AssertUnwindSafe(liquidate_fast(
+                                            &klend_client,
+                                            &obligation_key,
+                                            obligation.clone(),
+                                            market_state,
+                                            slot,
+                                            ltv_margin_pct,
+                                        )).catch_unwind().await;
+
+                                        match liquidation_result {
+                                            Ok(Ok(())) => {
+                                                info!("{} ✓ Liquidation completed", prefix);
+                                            }
+                                            Ok(Err(e)) => {
+                                                let err_str = format!("{:?}", e);
+                                                let classification = parallel::classify_error(&err_str);
+                                                match classification {
+                                                    parallel::ErrorClassification::Permanent(reason) => {
+                                                        info!("{} ✗ Permanent error ({})", prefix, reason);
+                                                    }
+                                                    parallel::ErrorClassification::Retryable(reason) => {
+                                                        warn!("{} ⟳ Retryable error ({})", prefix, reason);
+                                                    }
+                                                    parallel::ErrorClassification::Unknown => {
+                                                        warn!("{} ? Error: {}", prefix, &err_str[..100.min(err_str.len())]);
+                                                    }
+                                                }
+                                            }
+                                            Err(panic_info) => {
+                                                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                                    s.to_string()
+                                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                                    s.clone()
+                                                } else {
+                                                    "Unknown panic".to_string()
+                                                };
+                                                warn!("{} ⚠ Panic: {}", prefix, panic_msg);
+                                            }
                                         }
+
+                                        // Release orchestrator slot (cooldown starts)
+                                        orchestrator.finish(&obligation_key).await;
+                                        drop(permit);
                                     }
-                                    Err(panic_info) => {
-                                        // Panic occurred (e.g., unsupported price exponent in klend)
-                                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                                            s.to_string()
-                                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                                            s.clone()
-                                        } else {
-                                            "Unknown panic".to_string()
-                                        };
-                                        warn!("Liquidation panicked for {}: {}", obligation_update.pubkey, panic_msg);
+                                    None => {
+                                        // Blocked by dedup or rate limit
+                                        info!("[SKIP] {} already in-flight or cooldown", short_id);
                                     }
                                 }
                             } else if ltv_changed && ltv_info.ltv > Fraction::ZERO {
@@ -2131,6 +2172,7 @@ async fn crank_stream(
 }
 
 /// Cached market state for fast obligation evaluation
+#[derive(Clone)]
 #[allow(dead_code)]
 struct MarketState {
     lending_market: kamino_lending::LendingMarket,

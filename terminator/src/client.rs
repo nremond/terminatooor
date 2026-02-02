@@ -338,7 +338,11 @@ impl KlendClient {
             // Only add keys up to the 256 limit
             let space_available = MAX_LUT_ADDRESSES.saturating_sub(current_count);
             if space_available == 0 {
-                warn!("Lookup table for market {} is full (256 addresses)", market);
+                warn!(
+                    "Lookup table for market {} is full (256 addresses). {} keys not in LUT - \
+                    liquidations involving low-volume reserves may fail due to transaction size.",
+                    market, missing_keys.len()
+                );
                 return Ok(());
             }
 

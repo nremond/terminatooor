@@ -145,6 +145,8 @@ Per-market lookup tables to reduce transaction size:
 - **Cached in memory** after initial load - no RPC calls during liquidation
 - Periodic refresh skips ALT extension to avoid blocking the hot path
 
+**256 Address Limit**: Solana ALTs have a hard limit of 256 addresses. For markets with many reserves, the bot prioritizes reserves by borrow volume (most active first). If a market has more than ~22 reserves, low-volume reserves won't fit in the LUT, and liquidations involving those reserves may fail due to transaction size. See warning log: `Lookup table for market X is full (256 addresses)`
+
 ### 8. Liquidation Orchestrator (`parallel.rs`)
 Manages liquidation attempts with deduplication and cooldown:
 - **Deduplication**: Prevents attempting same obligation twice simultaneously
@@ -193,6 +195,21 @@ Positions with 5+ collateral types cannot be liquidated in a single transaction.
 - Jito bundles (but flash loans require borrow+repay in same TX)
 - Multiple partial liquidations
 - Custom on-chain helper program
+
+### Lookup Table Overflow
+
+Markets with many reserves (>22) exceed the 256-address ALT limit:
+
+| Symptom | Cause | Impact |
+|---------|-------|--------|
+| `Lookup table is full (256 addresses). X keys not in LUT` | Market has more reserves than ALT can hold | Liquidations involving low-volume reserves may exceed tx size |
+
+**Current behavior**: Reserves are prioritized by borrow volume. High-volume reserves are always in the LUT. Low-volume reserves may be excluded.
+
+**Future options**:
+- Multiple LUTs per market (overflow tables)
+- Per-liquidation check to skip positions involving excluded reserves
+- On-demand LUT creation for specific liquidations
 
 ## Token-2022 Support
 

@@ -6,7 +6,7 @@ authors = ["Kamino Finance Developers <dev@kamino.finance>"]
 description = "A rust klend liquidator"
 
 [[bin]]
-name = "klend-terminator"
+name = "terminatooor"
 path = "src/main.rs"
 
 [features]

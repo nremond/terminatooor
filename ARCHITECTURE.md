@@ -102,6 +102,9 @@ Real-time account monitoring via Triton/Helius WebSocket:
 - Receives instant updates when positions become unhealthy
 - Much faster than polling RPC endpoints
 - **Initialization order**: Geyser connection is deferred until AFTER market state loading to prevent channel overflow during startup
+- **Auto-reconnect**: Automatic reconnection with exponential backoff (500ms → 60s max)
+- **Stale connection detection**: If no messages received for 2 minutes, connection is considered stale and reconnects
+- **Connection timeout**: 30 second timeout for initial connection
 
 ### 2. Obligation Scanner (`scanner.rs`)
 Evaluates obligation health:

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use anchor_lang::prelude::Pubkey;
 use anyhow::{anyhow, Result};
-use backoff::ExponentialBackoff;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -87,28 +86,36 @@ impl GeyserStream {
 
 /// Run the gRPC stream with automatic reconnection on failures
 async fn run_stream_with_reconnect(config: GeyserConfig, tx: mpsc::Sender<ObligationUpdate>) {
-    let backoff = ExponentialBackoff {
-        initial_interval: Duration::from_millis(500),
-        max_interval: Duration::from_secs(30),
-        max_elapsed_time: None, // Never give up
-        ..Default::default()
-    };
+    let mut consecutive_failures: u32 = 0;
+    const MAX_BACKOFF_SECS: u64 = 60;
+    const INITIAL_BACKOFF_MS: u64 = 500;
 
     loop {
-        info!("Connecting to Geyser stream at {}", config.endpoint);
+        info!("Connecting to Geyser stream at {} (attempt {})", config.endpoint, consecutive_failures + 1);
 
         match connect_and_stream(&config, &tx).await {
             Ok(()) => {
-                info!("Geyser stream ended gracefully, reconnecting...");
+                // Stream ended gracefully (server closed connection)
+                warn!("Geyser stream ended gracefully, will reconnect...");
+                consecutive_failures = 0; // Reset on graceful close
             }
             Err(e) => {
-                error!("Geyser stream error: {:?}, reconnecting...", e);
+                consecutive_failures += 1;
+                error!(
+                    "Geyser stream error (failure #{}): {:?}",
+                    consecutive_failures, e
+                );
             }
         }
 
-        // Wait before reconnecting
-        let wait_time = backoff.initial_interval;
-        warn!("Waiting {:?} before reconnecting to Geyser...", wait_time);
+        // Calculate exponential backoff: 500ms, 1s, 2s, 4s, 8s, ... up to 60s
+        let backoff_ms = INITIAL_BACKOFF_MS * 2u64.saturating_pow(consecutive_failures.min(10));
+        let wait_time = Duration::from_millis(backoff_ms.min(MAX_BACKOFF_SECS * 1000));
+
+        warn!(
+            "Waiting {:?} before reconnecting to Geyser (failure count: {})...",
+            wait_time, consecutive_failures
+        );
         tokio::time::sleep(wait_time).await;
     }
 }
@@ -118,14 +125,26 @@ async fn connect_and_stream(
     config: &GeyserConfig,
     tx: &mpsc::Sender<ObligationUpdate>,
 ) -> Result<()> {
-    // Connect to Helius LaserStream using the builder pattern
-    let mut client = GeyserGrpcClient::build_from_shared(config.endpoint.clone())
-        .map_err(|e| anyhow!("Failed to create client builder: {:?}", e))?
-        .x_token(Some(config.api_key.clone()))
-        .map_err(|e| anyhow!("Failed to set token: {:?}", e))?
-        .connect()
+    // Connect to Helius LaserStream using the builder pattern with timeout
+    let connect_timeout = Duration::from_secs(30);
+
+    info!("Attempting to connect to Geyser endpoint...");
+
+    let connect_future = async {
+        GeyserGrpcClient::build_from_shared(config.endpoint.clone())
+            .map_err(|e| anyhow!("Failed to create client builder: {:?}", e))?
+            .x_token(Some(config.api_key.clone()))
+            .map_err(|e| anyhow!("Failed to set token: {:?}", e))?
+            .connect_timeout(connect_timeout)
+            .timeout(Duration::from_secs(60)) // Request timeout
+            .connect()
+            .await
+            .map_err(|e| anyhow!("Failed to connect to Geyser: {:?}", e))
+    };
+
+    let mut client = tokio::time::timeout(connect_timeout, connect_future)
         .await
-        .map_err(|e| anyhow!("Failed to connect to Geyser: {:?}", e))?;
+        .map_err(|_| anyhow!("Connection to Geyser timed out after {:?}", connect_timeout))??;
 
     info!("Connected to Geyser endpoint");
 
@@ -162,24 +181,55 @@ async fn connect_and_stream(
 
     info!("Subscribed to Kamino obligation updates for program {}", config.program_id);
 
-    // Process incoming messages
-    while let Some(message) = stream.next().await {
-        match message {
-            Ok(msg) => {
-                if let Some(update_oneof) = msg.update_oneof {
-                    if let Err(e) = process_update(update_oneof, tx).await {
-                        warn!("Error processing message: {:?}", e);
+    // Process incoming messages with a receive timeout
+    // If we don't receive any message (including pings) for this long, consider connection stale
+    let receive_timeout = Duration::from_secs(120); // 2 minutes
+    let mut last_message_time = std::time::Instant::now();
+    let mut messages_received: u64 = 0;
+
+    loop {
+        // Use a shorter timeout for the select to check staleness periodically
+        let check_interval = Duration::from_secs(10);
+
+        match tokio::time::timeout(check_interval, stream.next()).await {
+            Ok(Some(message)) => {
+                last_message_time = std::time::Instant::now();
+                messages_received += 1;
+
+                match message {
+                    Ok(msg) => {
+                        if let Some(update_oneof) = msg.update_oneof {
+                            if let Err(e) = process_update(update_oneof, tx).await {
+                                warn!("Error processing message: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Stream error after {} messages: {:?}", messages_received, e);
+                        return Err(anyhow!("Stream error: {:?}", e));
                     }
                 }
             }
-            Err(e) => {
-                error!("Stream error: {:?}", e);
-                return Err(anyhow!("Stream error: {:?}", e));
+            Ok(None) => {
+                // Stream ended (server closed)
+                info!("Geyser stream closed by server after {} messages", messages_received);
+                return Ok(());
+            }
+            Err(_) => {
+                // Timeout - check if connection is stale
+                let elapsed = last_message_time.elapsed();
+                if elapsed > receive_timeout {
+                    error!(
+                        "No messages received for {:?} (last message: {:?} ago), connection appears stale",
+                        receive_timeout, elapsed
+                    );
+                    return Err(anyhow!("Connection stale - no messages for {:?}", elapsed));
+                }
+                // Otherwise just continue waiting
+                debug!("No message in {:?}, still within timeout (last: {:?} ago)", check_interval, elapsed);
             }
         }
     }
-
-    Ok(())
 }
 
 /// Process a single update from the Geyser stream

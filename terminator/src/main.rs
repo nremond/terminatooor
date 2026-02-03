@@ -1248,49 +1248,8 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
             txn_size,
             (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
         );
-        let txn_b64 = BS64.encode(&txn_bytes);
-        println!(
-            "Simulation: https://explorer.solana.com/tx/inspector?message={}",
-            urlencoding::encode(&txn_b64)
-        );
-
-        let res = match klend_client
-            .client
-            .client
-            .simulate_transaction(&txn)
-            .await
+        // Skip simulation and submit directly for faster execution
         {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Transaction simulation failed: {:?}", e);
-                return Ok(());
-            }
-        };
-
-        // Check simulation result for errors
-        if let Some(err) = res.value.err {
-            // Check if obligation became healthy (race condition - expected behavior)
-            let is_healthy_error = res.value.logs.as_ref().map_or(false, |logs| {
-                logs.iter().any(|log| log.contains("ObligationHealthy"))
-            });
-            if is_healthy_error {
-                info!("Obligation recovered before liquidation (LTV now healthy)");
-            } else {
-                warn!("Simulation returned error: {:?}", err);
-                if let Some(logs) = &res.value.logs {
-                    for log in logs.iter().rev().take(5) {
-                        warn!("  Log: {}", log);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        info!("Simulation succeeded, units consumed: {:?}", res.value.units_consumed);
-
-        let should_send = true;
-
-        if should_send {
             match klend_client
                 .client
                 .send_retry_and_confirm_transaction(txn, None, false)
@@ -1707,59 +1666,8 @@ async fn liquidate_fast(
             (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
         );
 
-        // Skip simulation if LTV is significantly over threshold (>1%) for faster execution
-        // Marginal liquidations (barely over threshold) are likely to be race conditions anyway
-        const SKIP_SIMULATION_THRESHOLD: f64 = 0.01; // 1% over unhealthy threshold
-        let skip_simulation = ltv_margin_pct > SKIP_SIMULATION_THRESHOLD;
-
-        if skip_simulation {
-            info!(
-                "{} Skipping simulation (LTV margin {:.2}% > {:.0}% threshold) for faster execution",
-                log_prefix,
-                ltv_margin_pct * 100.0,
-                SKIP_SIMULATION_THRESHOLD * 100.0
-            );
-        } else {
-            let txn_b64 = BS64.encode(&txn_bytes);
-            debug!(
-                "{} Simulation: https://explorer.solana.com/tx/inspector?message={}",
-                log_prefix,
-                urlencoding::encode(&txn_b64)
-            );
-
-            let res = match klend_client
-                .client
-                .client
-                .simulate_transaction(&txn)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("{} Transaction simulation failed: {:?}", log_prefix, e);
-                    return Ok(());
-                }
-            };
-
-            if let Some(err) = res.value.err {
-                // Check if obligation became healthy (race condition - expected behavior)
-                let is_healthy_error = res.value.logs.as_ref().map_or(false, |logs| {
-                    logs.iter().any(|log| log.contains("ObligationHealthy"))
-                });
-                if is_healthy_error {
-                    info!("{} Obligation recovered before liquidation (LTV now healthy)", log_prefix);
-                } else {
-                    warn!("{} Simulation returned error: {:?}", log_prefix, err);
-                    if let Some(logs) = &res.value.logs {
-                        for log in logs.iter().rev().take(5) {
-                            warn!("{}   Log: {}", log_prefix, log);
-                        }
-                    }
-                }
-                return Ok(());
-            }
-
-            info!("{} Simulation succeeded, units consumed: {:?}", log_prefix, res.value.units_consumed);
-        }
+        // Skip simulation and submit directly for faster execution
+        info!("{} Skipping simulation for faster execution", log_prefix);
 
         let should_send = true;
 

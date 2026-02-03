@@ -16,7 +16,7 @@ use solana_sdk::{
     signer::Signer,
 };
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::EnvFilter;
 
 use crate::{
@@ -2099,7 +2099,10 @@ async fn crank_stream(
 
                                         match liquidation_result {
                                             Ok(Ok(())) => {
-                                                info!("{} ✓ Liquidation completed", prefix);
+                                                // Note: Ok(()) means the attempt finished without error,
+                                                // but the liquidation may have been skipped (e.g., obligation became healthy)
+                                                // The actual outcome is logged by liquidate_fast itself
+                                                debug!("{} Attempt finished", prefix);
                                             }
                                             Ok(Err(e)) => {
                                                 let err_str = format!("{:?}", e);

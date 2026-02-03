@@ -1314,6 +1314,7 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 ///
 /// `ltv_margin_pct` is how far over the unhealthy threshold the LTV is (as a ratio, e.g., 0.05 = 5%)
 /// If margin is high enough, we skip simulation to send faster
+/// `log_prefix` is used for structured logging (e.g., "[T1:8xBnR5kd]")
 async fn liquidate_fast(
     klend_client: &KlendClient,
     obligation_pubkey: &Pubkey,
@@ -1321,8 +1322,9 @@ async fn liquidate_fast(
     market_state: &MarketState,
     slot: u64,
     ltv_margin_pct: f64,
+    log_prefix: &str,
 ) -> Result<()> {
-    info!("Liquidating obligation {} (fast path)", obligation_pubkey.to_string().green());
+    info!("{} Liquidating obligation (fast path)", log_prefix);
     let rebalance_config = match &klend_client.rebalance_config {
         None => return Err(anyhow::anyhow!("Rebalance settings not found")),
         Some(c) => c,
@@ -1349,18 +1351,18 @@ async fn liquidate_fast(
 
     // Fetch fresh reserves for this obligation to avoid stale cumulative_borrow_rate
     // This prevents NegativeInterestRate errors when obligation was refreshed more recently than cached reserves
-    info!("Fetching fresh {} reserves for obligation", obligation_reserve_keys.len());
+    info!("{} Fetching fresh {} reserves", log_prefix, obligation_reserve_keys.len());
     for reserve_key in &obligation_reserve_keys {
         match klend_client.client.get_anchor_account::<Reserve>(reserve_key).await {
             Ok(fresh_reserve) => {
                 reserves.insert(*reserve_key, fresh_reserve);
             }
             Err(e) => {
-                warn!("Failed to fetch fresh reserve {}: {:?}, using cached", reserve_key, e);
+                warn!("{} Failed to fetch fresh reserve {}: {:?}, using cached", log_prefix, reserve_key, e);
             }
         }
     }
-    info!("Using {} reserves for market {}", reserves.len(), ob.lending_market);
+    debug!("{} Using {} reserves for market {}", log_prefix, reserves.len(), ob.lending_market);
 
     // Use the maximum slot from all sources plus a buffer to ensure clock is not behind any data.
     // RPC slot can lag behind Geyser or fetched data due to different endpoints/caching.
@@ -1386,7 +1388,7 @@ async fn liquidate_fast(
         .find(|d| d.deposit_reserve != Pubkey::default())
         .ok_or_else(|| anyhow::anyhow!("No valid deposit reserves in obligation"))?
         .deposit_reserve;
-    info!("Selected debt_reserve={} coll_reserve={}", debt_res_key, coll_res_key);
+    debug!("{} debt_reserve={} coll_reserve={}", log_prefix, debt_res_key, coll_res_key);
 
     // Refresh reserves and obligation (still fetches oracle prices - can't avoid for accuracy)
     operations::refresh_reserves_and_obligation(
@@ -1451,7 +1453,7 @@ async fn liquidate_fast(
         Some(LiquidationStrategy::LiquidateAndRedeem(liquidate_amount)) => (liquidate_amount, 0),
         Some(LiquidationStrategy::SwapThenLiquidate(_, liquidate_amount)) => (liquidate_amount, 0),
         None => {
-            info!("No liquidation strategy available");
+            info!("{} No liquidation strategy available", log_prefix);
             return Ok(());
         }
     };
@@ -1472,7 +1474,7 @@ async fn liquidate_fast(
         deposit_reserves.into_iter(),
     );
 
-    println!("Simulating the liquidation {:#?}", res);
+    debug!("{} Simulating the liquidation {:#?}", log_prefix, res);
 
     // Use original obligation for instructions (before simulation mutated it)
     let obligation_for_ix = StateWithKey::new(original_obligation, *obligation_pubkey);
@@ -1550,13 +1552,13 @@ async fn liquidate_fast(
                     let err_str = format!("{:?}", e);
                     if err_str.contains("TOKEN_NOT_TRADABLE") {
                         warn!(
-                            "Collateral {} is an LP/kToken (not tradable on DEX), skipping flash loan liquidation",
-                            coll_mint
+                            "{} Collateral {} is an LP/kToken (not tradable on DEX), skipping flash loan liquidation",
+                            log_prefix, coll_mint
                         );
                     } else {
                         warn!(
-                            "No swap route found from {} to {}: {:?}, skipping liquidation",
-                            coll_mint, debt_mint, e
+                            "{} No swap route found from {} to {}: {:?}, skipping liquidation",
+                            log_prefix, coll_mint, debt_mint, e
                         );
                     }
                     return Ok(());
@@ -1566,23 +1568,23 @@ async fn liquidate_fast(
             // PROFITABILITY CHECK
             let swap_out_amount = swap_result.route.out_amount;
             info!(
-                "Swap quote: in={} out={} (need {} to repay flash loan)",
-                swap_result.route.in_amount, swap_out_amount, repay_amount
+                "{} Swap quote: in={} out={} (need {} to repay flash loan)",
+                log_prefix, swap_result.route.in_amount, swap_out_amount, repay_amount
             );
 
             if swap_out_amount < repay_amount {
                 let loss = repay_amount - swap_out_amount;
                 warn!(
-                    "UNPROFITABLE: Swap output {} < repay amount {}. Would lose {} debt tokens. Skipping.",
-                    swap_out_amount, repay_amount, loss
+                    "{} UNPROFITABLE: Swap output {} < repay amount {}. Would lose {} debt tokens. Skipping.",
+                    log_prefix, swap_out_amount, repay_amount, loss
                 );
                 return Ok(());
             }
 
             let profit = swap_out_amount - repay_amount;
             info!(
-                "PROFITABLE: Expected profit = {} debt tokens (swap_out={} - repay={})",
-                profit, swap_out_amount, repay_amount
+                "{} PROFITABLE: Expected profit = {} debt tokens (swap_out={} - repay={})",
+                log_prefix, profit, swap_out_amount, repay_amount
             );
 
             let SwapResult { route: _, tx: swap_tx } = swap_result;
@@ -1622,7 +1624,8 @@ async fn liquidate_fast(
         ixns.push(flash_repay_ix.instruction);
 
         info!(
-            "Flash loan liquidation: borrow={}, repay={} (fee={}), expected_collateral={}",
+            "{} Flash loan liquidation: borrow={}, repay={} (fee={}), expected_collateral={}",
+            log_prefix,
             liquidate_amount,
             repay_amount,
             repay_amount - liquidate_amount,
@@ -1630,7 +1633,7 @@ async fn liquidate_fast(
         );
 
         // Debug: print instruction program IDs to diagnose error 2502
-        info!("Transaction instruction order (before ComputeBudget prepend):");
+        debug!("{} Transaction instruction order (before ComputeBudget prepend):", log_prefix);
         for (i, ix) in ixns.iter().enumerate() {
             let program_name = if ix.program_id == klend_client.program_id {
                 "Kamino".to_string()
@@ -1645,9 +1648,9 @@ async fn liquidate_fast(
             } else {
                 format!("{}...", &ix.program_id.to_string()[..8])
             };
-            info!("  [{}] {} ({})", i, program_name, ix.program_id);
+            debug!("{}   [{}] {} ({})", log_prefix, i, program_name, ix.program_id);
         }
-        info!("  Note: liquidate_ixns count = {}", liquidate_ixns.len());
+        debug!("{}   Note: liquidate_ixns count = {}", log_prefix, liquidate_ixns.len());
 
         // Build transaction with lookup tables
         let swap_luts_count = luts.len();
@@ -1656,7 +1659,7 @@ async fn liquidate_fast(
         // Add liquidator lookup table
         let mut total_luts = 0;
         if let Some(liquidator_lut) = klend_client.get_lookup_table(&lending_market.key) {
-            info!("Adding liquidator lookup table with {} addresses", liquidator_lut.addresses.len());
+            debug!("{} Adding liquidator lookup table with {} addresses", log_prefix, liquidator_lut.addresses.len());
             txn = txn.add_lookup_table(liquidator_lut);
             total_luts += 1;
         }
@@ -1671,7 +1674,7 @@ async fn liquidate_fast(
         let txn = match txn.build_with_budget_and_fee(&[]).await {
             Ok(t) => t,
             Err(e) => {
-                warn!("Failed to build transaction: {:?}", e);
+                warn!("{} Failed to build transaction: {:?}", log_prefix, e);
                 return Ok(());
             }
         };
@@ -1683,11 +1686,12 @@ async fn liquidate_fast(
 
         if txn_size > MAX_TX_SIZE {
             warn!(
-                "Transaction too large: {} bytes (max {}). Skipping liquidation.",
-                txn_size, MAX_TX_SIZE
+                "{} Transaction too large: {} bytes (max {}). Skipping liquidation.",
+                log_prefix, txn_size, MAX_TX_SIZE
             );
-            info!(
-                "Debug: {} instructions, {} lookup tables ({} liquidator, {} swap)",
+            debug!(
+                "{} Debug: {} instructions, {} lookup tables ({} liquidator, {} swap)",
+                log_prefix,
                 ixns.len(),
                 total_luts,
                 if klend_client.get_lookup_table(&lending_market.key).is_some() { 1 } else { 0 },
@@ -1696,8 +1700,9 @@ async fn liquidate_fast(
             return Ok(());
         }
 
-        info!(
-            "Transaction size: {} bytes ({:.1}% of max)",
+        debug!(
+            "{} Transaction size: {} bytes ({:.1}% of max)",
+            log_prefix,
             txn_size,
             (txn_size as f64 / MAX_TX_SIZE as f64) * 100.0
         );
@@ -1709,14 +1714,16 @@ async fn liquidate_fast(
 
         if skip_simulation {
             info!(
-                "Skipping simulation (LTV margin {:.2}% > {:.0}% threshold) for faster execution",
+                "{} Skipping simulation (LTV margin {:.2}% > {:.0}% threshold) for faster execution",
+                log_prefix,
                 ltv_margin_pct * 100.0,
                 SKIP_SIMULATION_THRESHOLD * 100.0
             );
         } else {
             let txn_b64 = BS64.encode(&txn_bytes);
-            println!(
-                "Simulation: https://explorer.solana.com/tx/inspector?message={}",
+            debug!(
+                "{} Simulation: https://explorer.solana.com/tx/inspector?message={}",
+                log_prefix,
                 urlencoding::encode(&txn_b64)
             );
 
@@ -1728,7 +1735,7 @@ async fn liquidate_fast(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("Transaction simulation failed: {:?}", e);
+                    warn!("{} Transaction simulation failed: {:?}", log_prefix, e);
                     return Ok(());
                 }
             };
@@ -1739,19 +1746,19 @@ async fn liquidate_fast(
                     logs.iter().any(|log| log.contains("ObligationHealthy"))
                 });
                 if is_healthy_error {
-                    info!("Obligation recovered before liquidation (LTV now healthy)");
+                    info!("{} Obligation recovered before liquidation (LTV now healthy)", log_prefix);
                 } else {
-                    warn!("Simulation returned error: {:?}", err);
+                    warn!("{} Simulation returned error: {:?}", log_prefix, err);
                     if let Some(logs) = &res.value.logs {
                         for log in logs.iter().rev().take(5) {
-                            warn!("  Log: {}", log);
+                            warn!("{}   Log: {}", log_prefix, log);
                         }
                     }
                 }
                 return Ok(());
             }
 
-            info!("Simulation succeeded, units consumed: {:?}", res.value.units_consumed);
+            info!("{} Simulation succeeded, units consumed: {:?}", log_prefix, res.value.units_consumed);
         }
 
         let should_send = true;
@@ -1763,11 +1770,11 @@ async fn liquidate_fast(
                 .await
             {
                 Ok(sig) => {
-                    info!("Liquidation tx sent: {:?}", sig.0);
-                    info!("Liquidation tx res: {:?}", sig.1);
+                    info!("{} ✓ Liquidation tx sent: {:?}", log_prefix, sig.0);
+                    debug!("{} Liquidation tx res: {:?}", log_prefix, sig.1);
                 }
                 Err(e) => {
-                    warn!("Liquidation tx failed: {:?}", e);
+                    warn!("{} ✗ Liquidation tx failed: {:?}", log_prefix, e);
                 }
             }
         }
@@ -2095,6 +2102,7 @@ async fn crank_stream(
                                             market_state,
                                             slot,
                                             ltv_margin_pct,
+                                            &prefix,
                                         )).catch_unwind().await;
 
                                         match liquidation_result {

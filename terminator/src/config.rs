@@ -87,8 +87,7 @@ fn validate_keypair_for_action(keypair: &Option<Keypair>) -> Result<()> {
 
 pub fn get_rebalance_config_for_action(action: &Actions) -> Option<RebalanceConfig> {
     match action {
-        Actions::Liquidate { rebalance_args, .. }
-        | Actions::Crank { rebalance_args, .. }
+        Actions::Crank { rebalance_args, .. }
         | Actions::CrankStream { rebalance_args, .. }
         | Actions::Rebalance { rebalance_args, .. }
         | Actions::Swap { rebalance_args, .. }

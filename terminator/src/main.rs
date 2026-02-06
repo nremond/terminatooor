@@ -2,7 +2,6 @@ use std::{collections::HashMap, panic::AssertUnwindSafe, path::PathBuf, sync::Ar
 use futures::FutureExt;
 
 use anchor_client::{solana_sdk::pubkey::Pubkey, Cluster};
-use base64::engine::{general_purpose::STANDARD as BS64, Engine};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -10,7 +9,7 @@ use consts::WRAPPED_SOL_MINT;
 use itertools::Itertools;
 use crate::routing::DecompiledVersionedTx;
 use bytemuck::try_from_bytes;
-use kamino_lending::{LendingMarket, Obligation, Reserve, ReserveFarmKind};
+use kamino_lending::{Obligation, Reserve, ReserveFarmKind};
 use solana_sdk::{
     compute_budget::{self},
     signer::Signer,
@@ -293,7 +292,6 @@ async fn test_flash_liquidation(
 ) -> Result<()> {
     use base64::engine::general_purpose::STANDARD as BS64;
     use base64::Engine;
-    use solana_sdk::compute_budget;
 
     info!("=== Testing Flash Loan Liquidation ===");
 
@@ -572,7 +570,7 @@ async fn test_flash_liquidation(
 
     // Identify key positions
     let flash_borrow_pos = 0;
-    let liquidate_pos = liquidate_ixns.iter().position(|ix| {
+    let _liquidate_pos = liquidate_ixns.iter().position(|ix| {
         // Liquidate instruction has a specific discriminator
         ix.data.len() >= 8
     }).map(|p| p + 1); // +1 for flash_borrow
@@ -1271,8 +1269,6 @@ async fn liquidate(klend_client: &KlendClient, obligation: &Pubkey) -> Result<()
 /// Fast liquidation path for streaming mode - uses cached data to minimize RPC calls
 /// Saves ~250ms by avoiding redundant fetches of obligation, reserves, referrer_token_states
 ///
-/// `ltv_margin_pct` is how far over the unhealthy threshold the LTV is (as a ratio, e.g., 0.05 = 5%)
-/// If margin is high enough, we skip simulation to send faster
 /// `log_prefix` is used for structured logging (e.g., "[T1:8xBnR5kd]")
 async fn liquidate_fast(
     klend_client: &KlendClient,
@@ -1280,7 +1276,7 @@ async fn liquidate_fast(
     obligation: Obligation,
     market_state: &MarketState,
     slot: u64,
-    ltv_margin_pct: f64,
+    _ltv_margin_pct: f64,
     log_prefix: &str,
 ) -> Result<()> {
     info!("{} Liquidating obligation (fast path)", log_prefix);

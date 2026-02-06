@@ -2,6 +2,7 @@ use std::{collections::HashMap, panic::AssertUnwindSafe, path::PathBuf, sync::Ar
 use futures::FutureExt;
 
 use anchor_client::{solana_sdk::pubkey::Pubkey, Cluster};
+use anchor_lang::AccountDeserialize;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -898,17 +899,28 @@ async fn liquidate_fast(
         }
     }
 
-    // Fetch fresh reserves for this obligation to avoid stale cumulative_borrow_rate
+    // Fetch fresh reserves in a single batch RPC call to avoid stale cumulative_borrow_rate
     // This prevents NegativeInterestRate errors when obligation was refreshed more recently than cached reserves
-    info!("{} Fetching fresh {} reserves", log_prefix, obligation_reserve_keys.len());
-    for reserve_key in &obligation_reserve_keys {
-        match klend_client.client.get_anchor_account::<Reserve>(reserve_key).await {
-            Ok(fresh_reserve) => {
-                reserves.insert(*reserve_key, fresh_reserve);
+    info!("{} Fetching fresh {} reserves (batch)", log_prefix, obligation_reserve_keys.len());
+    let reserve_accounts = klend_client
+        .client
+        .client
+        .get_multiple_accounts(&obligation_reserve_keys)
+        .await
+        .unwrap_or_default();
+    for (i, account_opt) in reserve_accounts.iter().enumerate() {
+        let reserve_key = &obligation_reserve_keys[i];
+        if let Some(account) = account_opt {
+            match Reserve::try_deserialize(&mut account.data.as_slice()) {
+                Ok(fresh_reserve) => {
+                    reserves.insert(*reserve_key, fresh_reserve);
+                }
+                Err(e) => {
+                    warn!("{} Failed to deserialize reserve {}: {:?}, using cached", log_prefix, reserve_key, e);
+                }
             }
-            Err(e) => {
-                warn!("{} Failed to fetch fresh reserve {}: {:?}, using cached", log_prefix, reserve_key, e);
-            }
+        } else {
+            warn!("{} Reserve {} not found, using cached", log_prefix, reserve_key);
         }
     }
     debug!("{} Using {} reserves for market {}", log_prefix, reserves.len(), ob.lending_market);

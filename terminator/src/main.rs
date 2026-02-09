@@ -1284,7 +1284,19 @@ async fn liquidate_fast(
                     debug!("{} Liquidation tx res: {:?}", log_prefix, sig.1);
                 }
                 Err(e) => {
-                    warn!("{} ✗ Liquidation tx failed: {:?}", log_prefix, e);
+                    let err_str = format!("{:?}", e);
+                    // Parse common Kamino error codes for better logging
+                    if err_str.contains("Custom(6016)") {
+                        info!("{} ✗ Lost race: obligation already liquidated (6016)", log_prefix);
+                    } else if err_str.contains("Custom(6009)") {
+                        warn!("{} ✗ Reserve stale - needs refresh (6009)", log_prefix);
+                    } else if err_str.contains("Custom(6023)") {
+                        warn!("{} ✗ Obligation stale - needs refresh (6023)", log_prefix);
+                    } else if err_str.contains("Custom(6015)") {
+                        info!("{} ✗ Liquidation amount too small (6015)", log_prefix);
+                    } else {
+                        warn!("{} ✗ Liquidation tx failed: {:?}", log_prefix, e);
+                    }
                 }
             }
         }

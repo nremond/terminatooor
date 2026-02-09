@@ -1,14 +1,17 @@
-//! Geyser/LaserStream integration for real-time obligation monitoring.
+//! Geyser/LaserStream integration for real-time obligation and oracle monitoring.
 //!
 //! This module provides streaming updates from Helius LaserStream (Yellowstone gRPC)
 //! to detect obligation changes in real-time instead of polling.
+//! It also streams oracle price updates (Pyth, Switchboard, Scope) to avoid RPC latency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anchor_lang::prelude::Pubkey;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
+use anchor_client::solana_sdk::account::Account;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
@@ -26,6 +29,106 @@ pub struct GeyserConfig {
     pub api_key: String,
     /// Kamino lending program ID to monitor
     pub program_id: Pubkey,
+    /// Oracle account pubkeys to stream (Pyth, Switchboard, Scope)
+    pub oracle_accounts: HashSet<Pubkey>,
+}
+
+/// Thread-safe cache for oracle account data
+/// Updated in real-time via Geyser stream
+#[derive(Debug, Clone)]
+pub struct OracleCache {
+    /// Map from oracle pubkey to (slot, account_data)
+    inner: Arc<RwLock<HashMap<Pubkey, (u64, Vec<u8>)>>>,
+}
+
+impl OracleCache {
+    /// Create a new empty oracle cache
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Initialize cache with existing oracle data from MarketState
+    pub fn init_from_market_state(
+        &self,
+        pyth: &HashMap<Pubkey, Vec<u8>>,
+        switchboard: &HashMap<Pubkey, Vec<u8>>,
+        scope: &HashMap<Pubkey, Vec<u8>>,
+    ) {
+        let mut cache = self.inner.write().unwrap();
+        for (k, v) in pyth.iter() {
+            cache.insert(*k, (0, v.clone()));
+        }
+        for (k, v) in switchboard.iter() {
+            cache.insert(*k, (0, v.clone()));
+        }
+        for (k, v) in scope.iter() {
+            cache.insert(*k, (0, v.clone()));
+        }
+        info!("Oracle cache initialized with {} accounts", cache.len());
+    }
+
+    /// Update an oracle account in the cache
+    pub fn update(&self, pubkey: Pubkey, slot: u64, data: Vec<u8>) {
+        let mut cache = self.inner.write().unwrap();
+        // Only update if slot is newer (or first update)
+        if let Some((existing_slot, _)) = cache.get(&pubkey) {
+            if slot <= *existing_slot {
+                return; // Ignore stale updates
+            }
+        }
+        cache.insert(pubkey, (slot, data));
+    }
+
+    /// Get oracle account data
+    pub fn get(&self, pubkey: &Pubkey) -> Option<Vec<u8>> {
+        self.inner.read().unwrap().get(pubkey).map(|(_, data)| data.clone())
+    }
+
+    /// Get oracle account data as Account struct (for compatibility with existing code)
+    pub fn get_account(&self, pubkey: &Pubkey) -> Option<Account> {
+        self.inner.read().unwrap().get(pubkey).map(|(_, data)| Account {
+            lamports: 0,
+            data: data.clone(),
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    /// Get multiple oracle accounts
+    pub fn get_multiple(&self, pubkeys: &[Pubkey]) -> Vec<Option<Account>> {
+        let cache = self.inner.read().unwrap();
+        pubkeys
+            .iter()
+            .map(|pk| {
+                cache.get(pk).map(|(_, data)| Account {
+                    lamports: 0,
+                    data: data.clone(),
+                    owner: Pubkey::default(),
+                    executable: false,
+                    rent_epoch: 0,
+                })
+            })
+            .collect()
+    }
+
+    /// Check if a pubkey is in the cache
+    pub fn contains(&self, pubkey: &Pubkey) -> bool {
+        self.inner.read().unwrap().contains_key(pubkey)
+    }
+
+    /// Get the number of cached oracles
+    pub fn len(&self) -> usize {
+        self.inner.read().unwrap().len()
+    }
+}
+
+impl Default for OracleCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// An update received from the Geyser stream
@@ -46,23 +149,33 @@ pub struct GeyserStream {
     rx: mpsc::Receiver<ObligationUpdate>,
     /// Handle to the background streaming task
     _task_handle: tokio::task::JoinHandle<()>,
+    /// Shared oracle cache updated by the stream
+    oracle_cache: OracleCache,
 }
 
 impl GeyserStream {
     /// Create a new Geyser stream and start listening for obligation updates
     pub async fn connect(config: GeyserConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(1000);
+        let oracle_cache = OracleCache::new();
 
         let config_clone = config.clone();
+        let oracle_cache_clone = oracle_cache.clone();
         let task_handle = tokio::spawn(async move {
-            run_stream_with_reconnect(config_clone, tx).await;
+            run_stream_with_reconnect(config_clone, tx, oracle_cache_clone).await;
         });
 
         Ok(Self {
             config,
             rx,
             _task_handle: task_handle,
+            oracle_cache,
         })
+    }
+
+    /// Get a reference to the oracle cache
+    pub fn oracle_cache(&self) -> &OracleCache {
+        &self.oracle_cache
     }
 
     /// Receive the next obligation update
@@ -85,7 +198,11 @@ impl GeyserStream {
 }
 
 /// Run the gRPC stream with automatic reconnection on failures
-async fn run_stream_with_reconnect(config: GeyserConfig, tx: mpsc::Sender<ObligationUpdate>) {
+async fn run_stream_with_reconnect(
+    config: GeyserConfig,
+    tx: mpsc::Sender<ObligationUpdate>,
+    oracle_cache: OracleCache,
+) {
     let mut consecutive_failures: u32 = 0;
     const MAX_BACKOFF_SECS: u64 = 60;
     const INITIAL_BACKOFF_MS: u64 = 500;
@@ -93,7 +210,7 @@ async fn run_stream_with_reconnect(config: GeyserConfig, tx: mpsc::Sender<Obliga
     loop {
         info!("Connecting to Geyser stream at {} (attempt {})", config.endpoint, consecutive_failures + 1);
 
-        match connect_and_stream(&config, &tx).await {
+        match connect_and_stream(&config, &tx, &oracle_cache).await {
             Ok(()) => {
                 // Stream ended gracefully (server closed connection)
                 warn!("Geyser stream ended gracefully, will reconnect...");
@@ -124,6 +241,7 @@ async fn run_stream_with_reconnect(config: GeyserConfig, tx: mpsc::Sender<Obliga
 async fn connect_and_stream(
     config: &GeyserConfig,
     tx: &mpsc::Sender<ObligationUpdate>,
+    oracle_cache: &OracleCache,
 ) -> Result<()> {
     // Connect to Helius LaserStream using the builder pattern with timeout
     let connect_timeout = Duration::from_secs(30);
@@ -160,6 +278,24 @@ async fn connect_and_stream(
         },
     );
 
+    // Also subscribe to oracle accounts (Pyth, Switchboard, Scope) by specific pubkey
+    if !config.oracle_accounts.is_empty() {
+        let oracle_pubkeys: Vec<String> = config
+            .oracle_accounts
+            .iter()
+            .map(|pk| pk.to_string())
+            .collect();
+        info!("Subscribing to {} oracle accounts", oracle_pubkeys.len());
+        accounts_filter.insert(
+            "oracle_accounts".to_string(),
+            SubscribeRequestFilterAccounts {
+                account: oracle_pubkeys,
+                owner: vec![], // No owner filter - subscribe by specific pubkey
+                filters: vec![],
+            },
+        );
+    }
+
     let request = SubscribeRequest {
         accounts: accounts_filter,
         slots: HashMap::new(),
@@ -179,7 +315,11 @@ async fn connect_and_stream(
         .await
         .map_err(|e| anyhow!("Failed to subscribe: {:?}", e))?;
 
-    info!("Subscribed to Kamino obligation updates for program {}", config.program_id);
+    info!(
+        "Subscribed to Kamino obligations (program {}) and {} oracle accounts",
+        config.program_id,
+        config.oracle_accounts.len()
+    );
 
     // Process incoming messages with a receive timeout
     // If we don't receive any message (including pings) for this long, consider connection stale
@@ -199,7 +339,7 @@ async fn connect_and_stream(
                 match message {
                     Ok(msg) => {
                         if let Some(update_oneof) = msg.update_oneof {
-                            if let Err(e) = process_update(update_oneof, tx).await {
+                            if let Err(e) = process_update(update_oneof, tx, oracle_cache, &config.oracle_accounts).await {
                                 warn!("Error processing message: {:?}", e);
                             }
                         }
@@ -236,6 +376,8 @@ async fn connect_and_stream(
 async fn process_update(
     update: UpdateOneof,
     tx: &mpsc::Sender<ObligationUpdate>,
+    oracle_cache: &OracleCache,
+    oracle_pubkeys: &HashSet<Pubkey>,
 ) -> Result<()> {
     match update {
         UpdateOneof::Account(account_update) => {
@@ -249,13 +391,21 @@ async fn process_update(
                 .try_into()
                 .map_err(|_| anyhow!("Invalid pubkey length"))?;
             let pubkey = Pubkey::from(pubkey_bytes);
+            let slot = account_update.slot;
 
-            // Check if this looks like an obligation account
+            // Check if this is an oracle account update
+            if oracle_pubkeys.contains(&pubkey) {
+                oracle_cache.update(pubkey, slot, account.data);
+                debug!("Updated oracle cache: {} at slot {}", pubkey, slot);
+                return Ok(());
+            }
+
+            // Otherwise, check if this looks like an obligation account
             // Obligations have a specific discriminator and minimum size
             if account.data.len() >= 8 {
                 let update = ObligationUpdate {
                     pubkey,
-                    slot: account_update.slot,
+                    slot,
                     data: account.data,
                 };
 

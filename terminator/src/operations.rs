@@ -263,6 +263,105 @@ pub async fn refresh_reserves_and_obligation(
     Ok(())
 }
 
+/// Refresh reserves and obligation using cached oracle data (no RPC calls)
+/// This is the fast path that uses pre-fetched oracle data from Geyser stream
+#[allow(clippy::too_many_arguments)]
+pub fn refresh_reserves_and_obligation_with_cache(
+    obligation_addr: &Pubkey,
+    obligation_state: &mut Obligation,
+    reserves: &mut HashMap<Pubkey, Reserve>,
+    referrer_token_states: &HashMap<Pubkey, ReferrerTokenState>,
+    lending_market: &LendingMarket,
+    clock: &Clock,
+    oracle_cache: &crate::geyser::OracleCache,
+) -> Result<()> {
+    // Build oracle account data from cache
+    let mut pyth_accounts: Vec<(Pubkey, bool, solana_sdk::account::Account)> = Vec::new();
+    let mut switchboard_accounts: Vec<(Pubkey, bool, solana_sdk::account::Account)> = Vec::new();
+    let mut scope_accounts: Vec<(Pubkey, bool, solana_sdk::account::Account)> = Vec::new();
+
+    for (_, reserve) in reserves.iter() {
+        // Pyth
+        let pyth_pk = reserve.config.token_info.pyth_configuration.price;
+        if let Some(acc) = oracle_cache.get_account(&pyth_pk) {
+            pyth_accounts.push((pyth_pk, false, acc));
+        }
+
+        // Switchboard price aggregator
+        let sw_price_pk = reserve.config.token_info.switchboard_configuration.price_aggregator;
+        if let Some(acc) = oracle_cache.get_account(&sw_price_pk) {
+            switchboard_accounts.push((sw_price_pk, false, acc));
+        }
+
+        // Switchboard TWAP aggregator
+        let sw_twap_pk = reserve.config.token_info.switchboard_configuration.twap_aggregator;
+        if let Some(acc) = oracle_cache.get_account(&sw_twap_pk) {
+            switchboard_accounts.push((sw_twap_pk, false, acc));
+        }
+
+        // Scope
+        let scope_pk = reserve.config.token_info.scope_configuration.price_feed;
+        if let Some(acc) = oracle_cache.get_account(&scope_pk) {
+            scope_accounts.push((scope_pk, false, acc));
+        }
+    }
+
+    let pyth_account_infos = map_accounts_and_create_infos(&mut pyth_accounts);
+    let switchboard_feed_infos = map_accounts_and_create_infos(&mut switchboard_accounts);
+    let scope_price_infos = map_accounts_and_create_infos(&mut scope_accounts);
+
+    // Collect all unique reserve keys from the obligation (deposits + borrows)
+    let mut all_reserve_keys: Vec<Pubkey> = Vec::new();
+    for deposit in obligation_state.deposits.iter() {
+        if deposit.deposit_reserve != Pubkey::default() && !all_reserve_keys.contains(&deposit.deposit_reserve) {
+            all_reserve_keys.push(deposit.deposit_reserve);
+        }
+    }
+    for borrow in obligation_state.borrows.iter() {
+        if borrow.borrow_reserve != Pubkey::default() && !all_reserve_keys.contains(&borrow.borrow_reserve) {
+            all_reserve_keys.push(borrow.borrow_reserve);
+        }
+    }
+
+    // Refresh ALL reserves referenced by the obligation (required by Kamino protocol)
+    for reserve_key in &all_reserve_keys {
+        if let Some(reserve_state) = reserves.get_mut(reserve_key) {
+            refresh_reserve(
+                reserve_key,
+                reserve_state,
+                lending_market,
+                clock,
+                &pyth_account_infos,
+                &switchboard_feed_infos,
+                &scope_price_infos,
+            )?;
+        } else {
+            return Err(anyhow::anyhow!("Reserve {} not found in reserves", reserve_key));
+        }
+    }
+
+    let ObligationReserves {
+        borrow_reserves,
+        deposit_reserves,
+    } = obligation_reserves(obligation_state, reserves)?;
+    let referrer_states = referrer_token_states_of_obligation(
+        obligation_addr,
+        obligation_state,
+        &borrow_reserves,
+        referrer_token_states,
+    )?;
+
+    kamino_lending::lending_market::lending_operations::refresh_obligation(
+        obligation_state,
+        lending_market,
+        clock.slot,
+        deposit_reserves.into_iter(),
+        borrow_reserves.into_iter(),
+        referrer_states.into_iter(),
+    )?;
+    Ok(())
+}
+
 pub fn referrer_token_states_of_obligation(
     obligation_addr: &Pubkey,
     obligation: &Obligation,

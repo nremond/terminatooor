@@ -863,6 +863,7 @@ pub mod swap {
 
 /// Fast liquidation path for streaming mode - uses cached data to minimize RPC calls
 /// Saves ~250ms by avoiding redundant fetches of obligation, reserves, referrer_token_states
+/// Uses streamed oracle prices from Geyser to avoid additional RPC latency
 ///
 /// `log_prefix` is used for structured logging (e.g., "[T1:8xBnR5kd]")
 async fn liquidate_fast(
@@ -873,6 +874,7 @@ async fn liquidate_fast(
     slot: u64,
     _ltv_margin_pct: f64,
     log_prefix: &str,
+    oracle_cache: &geyser::OracleCache,
 ) -> Result<()> {
     info!("{} Liquidating obligation (fast path)", log_prefix);
     let rebalance_config = match &klend_client.rebalance_config {
@@ -951,19 +953,16 @@ async fn liquidate_fast(
         .deposit_reserve;
     debug!("{} debt_reserve={} coll_reserve={}", log_prefix, debt_res_key, coll_res_key);
 
-    // Refresh reserves and obligation (still fetches oracle prices - can't avoid for accuracy)
-    operations::refresh_reserves_and_obligation(
-        klend_client,
-        &debt_res_key,
-        &coll_res_key,
+    // Refresh reserves and obligation using cached oracle data (no RPC calls!)
+    operations::refresh_reserves_and_obligation_with_cache(
         obligation_pubkey,
         &mut ob,
         &mut reserves,
         rts,
         market,
         &clock,
-    )
-    .await?;
+        oracle_cache,
+    )?;
 
     // Now it's all fully refreshed and up to date
     let debt_reserve_state = *reserves.get(&debt_res_key).ok_or_else(|| {
@@ -1500,15 +1499,35 @@ async fn crank_stream(
         }
     }
 
+    // Collect all oracle account pubkeys from market states for streaming
+    let mut oracle_accounts: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+    for state in market_states.values() {
+        oracle_accounts.extend(state.pyth_accounts.keys());
+        oracle_accounts.extend(state.switchboard_accounts.keys());
+        oracle_accounts.extend(state.scope_accounts.keys());
+    }
+    info!("Collected {} oracle accounts for streaming", oracle_accounts.len());
+
     // Connect to Geyser AFTER initialization is complete
     let geyser_config = GeyserConfig {
         endpoint: geyser_endpoint,
         api_key: geyser_api_key,
         program_id: klend_client.program_id,
+        oracle_accounts,
     };
 
     let mut geyser_stream = GeyserStream::connect(geyser_config).await?;
     info!("Connected to Geyser stream");
+
+    // Initialize oracle cache with existing data from market states
+    for state in market_states.values() {
+        geyser_stream.oracle_cache().init_from_market_state(
+            &state.pyth_accounts,
+            &state.switchboard_accounts,
+            &state.scope_accounts,
+        );
+    }
+    info!("Oracle cache initialized with {} accounts", geyser_stream.oracle_cache().len());
 
     // Create the parallel liquidation orchestrator (wrapped in Arc for sharing across tasks)
     let orchestrator = Arc::new(parallel::LiquidationOrchestrator::new(parallel_config.clone()));
@@ -1625,6 +1644,7 @@ async fn crank_stream(
                                             slot,
                                             ltv_margin_pct,
                                             &prefix,
+                                            geyser_stream.oracle_cache(),
                                         )).catch_unwind().await;
 
                                         match liquidation_result {

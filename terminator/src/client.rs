@@ -592,12 +592,15 @@ impl KlendClient {
         let mut pre_instructions = vec![];
         let mut post_instructions = vec![];
 
+        let wrap_start = std::time::Instant::now();
         let obligation_state = *(obligation.state.borrow());
         let obligation_address = obligation.key;
 
+        let rpc_start = std::time::Instant::now();
         let (deposit_reserves, borrow_reserves, referrer_token_states) = self
             .get_obligation_reserves_and_referrer_token_states(&obligation_state)
             .await;
+        tracing::debug!("  get_obligation_reserves_and_referrer_token_states: {}ms", rpc_start.elapsed().as_millis());
 
         let mut unique_reserves = deposit_reserves
             .iter()
@@ -618,9 +621,11 @@ impl KlendClient {
                     reserve_state.get_farm(ReserveFarmKind::Collateral),
                 )
             };
+            let farm_start = std::time::Instant::now();
             let (obligation_farm_debt, obligation_farm_coll) =
                 obligation_farms(&self.client, farm_debt, farm_collateral, obligation_address)
                     .await;
+            tracing::debug!("  obligation_farms: {}ms", farm_start.elapsed().as_millis());
 
             if farm_debt != Pubkey::default() && obligation_farm_debt.is_none() {
                 let init_obligation_farm_ix = instructions::init_obligation_farm_for_reserve_ix(
@@ -658,6 +663,7 @@ impl KlendClient {
         }
 
         // 2. Build Refresh Reserve (for the non-instruction reserves - i.e. deposit, borrow)
+        let reserve_fetch_start = std::time::Instant::now();
         for reserve_acc in unique_reserves {
             if instruction_reserves.contains(&reserve_acc) {
                 continue;
@@ -672,8 +678,10 @@ impl KlendClient {
             println!("Adding pre-ixn refresh_reserve unique {:?}", reserve_acc);
             pre_instructions.push(refresh_reserve_ix);
         }
+        tracing::debug!("  fetch unique reserves: {}ms", reserve_fetch_start.elapsed().as_millis());
 
         // 3. Build Refresh Reserve (for the current instruction - i.e. deposit, borrow)
+        let ix_reserve_start = std::time::Instant::now();
         for reserve_acc in instruction_reserves {
             let reserve: Reserve = self.client.get_anchor_account(&reserve_acc).await.unwrap();
             let refresh_reserve_ix = instructions::refresh_reserve_ix(
@@ -685,6 +693,7 @@ impl KlendClient {
             println!("Adding pre-ixn refresh_reserve current {:?}", reserve_acc);
             pre_instructions.push(refresh_reserve_ix);
         }
+        tracing::debug!("  fetch instruction reserves: {}ms", ix_reserve_start.elapsed().as_millis());
 
         // 4. Build Refresh Obligation
         let refresh_obligation_ix = instructions::refresh_obligation_ix(
@@ -700,6 +709,7 @@ impl KlendClient {
         println!("Adding pre-ixn refresh_obligation");
         pre_instructions.push(refresh_obligation_ix);
 
+        let farm_refresh_start = std::time::Instant::now();
         for (reserve_acc, farm_mode) in reserve_accts.iter().zip(farm_modes.iter()) {
             let reserve: Reserve = self
                 .client
@@ -737,12 +747,14 @@ impl KlendClient {
             }
         }
 
+        tracing::debug!("  farm refresh reserves: {}ms", farm_refresh_start.elapsed().as_millis());
         println!(
             "wrap_obligation_instruction_with_farms: {} pre_ixs, {} post_ixs (skip_post={})",
             pre_instructions.len(),
             post_instructions.len(),
             skip_post_farm_refresh
         );
+        tracing::info!("wrap_obligation_instruction_with_farms total: {}ms", wrap_start.elapsed().as_millis());
 
         (pre_instructions, post_instructions)
     }

@@ -17,6 +17,7 @@ use anchor_client::{
     },
     solana_sdk::pubkey::Pubkey,
 };
+use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
 use kamino_lending::{
     utils::seeds, LendingMarket, Obligation, ReferrerTokenState, Reserve, ReserveFarmKind,
@@ -489,6 +490,8 @@ impl KlendClient {
     /// # Arguments
     /// * `skip_post_farm_refresh` - If true, omits post-liquidation farm refresh instructions
     ///   to reduce transaction size. Use for flash loan liquidations.
+    /// * `reserve_cache` - Optional cache of reserves to avoid RPC fetches. Pass reserves from
+    ///   market state to eliminate ~100ms of RPC latency.
     #[allow(clippy::too_many_arguments)]
     pub async fn liquidate_obligation_and_redeem_reserve_collateral_ixns(
         &self,
@@ -500,6 +503,7 @@ impl KlendClient {
         min_acceptable_received_coll_amount: u64,
         max_allowed_ltv_override_pct_opt: Option<u64>,
         skip_post_farm_refresh: bool,
+        reserve_cache: Option<&HashMap<Pubkey, Reserve>>,
     ) -> Result<Vec<Instruction>> {
         let liquidate_ix = instructions::liquidate_obligation_and_redeem_reserve_collateral_ix(
             &self.program_id,
@@ -520,6 +524,7 @@ impl KlendClient {
                 &obligation,
                 &self.liquidator.wallet.clone(),
                 skip_post_farm_refresh,
+                reserve_cache,
             )
             .await;
 
@@ -556,6 +561,7 @@ impl KlendClient {
                 min_acceptable_received_coll_amount,
                 max_allowed_ltv_override_pct_opt,
                 false, // Include post farm refresh for non-flash loan liquidations
+                None, // No reserve cache available in this code path
             )
             .await?;
 
@@ -572,6 +578,7 @@ impl KlendClient {
     /// Wraps an obligation instruction with necessary refresh/farm instructions.
     ///
     /// # Arguments
+    /// * `reserve_cache` - Optional cache of reserves to avoid RPC fetches. If None, will fetch from RPC.
     /// * `skip_post_farm_refresh` - If true, skips post-liquidation farm refresh to reduce tx size.
     ///   Use this for flash loan liquidations where the tx is already at the size limit.
     pub async fn wrap_obligation_instruction_with_farms(
@@ -581,6 +588,7 @@ impl KlendClient {
         obligation: &StateWithKey<Obligation>,
         payer: &Arc<Keypair>,
         skip_post_farm_refresh: bool,
+        reserve_cache: Option<&HashMap<Pubkey, Reserve>>,
     ) -> (Vec<InstructionBlocks>, Vec<InstructionBlocks>) {
         // If has farms, also do init farm obligations
         // Always do refresh_reserve
@@ -622,8 +630,9 @@ impl KlendClient {
                 )
             };
             let farm_start = std::time::Instant::now();
+            // Use batched version for single RPC call instead of multiple sequential calls
             let (obligation_farm_debt, obligation_farm_coll) =
-                obligation_farms(&self.client, farm_debt, farm_collateral, obligation_address)
+                obligation_farms_batched(&self.client.client, farm_debt, farm_collateral, obligation_address)
                     .await;
             tracing::debug!("  obligation_farms: {}ms", farm_start.elapsed().as_millis());
 
@@ -668,7 +677,16 @@ impl KlendClient {
             if instruction_reserves.contains(&reserve_acc) {
                 continue;
             }
-            let reserve: Reserve = self.client.get_anchor_account(&reserve_acc).await.unwrap();
+            // Use cache if available, otherwise fetch from RPC
+            let reserve_opt: Option<Reserve> = if let Some(cache) = reserve_cache {
+                cache.get(&reserve_acc).cloned()
+            } else {
+                self.client.get_anchor_account(&reserve_acc).await.ok()
+            };
+            let Some(reserve) = reserve_opt else {
+                tracing::warn!("Reserve {} not found in cache or RPC", reserve_acc);
+                continue;
+            };
             let refresh_reserve_ix = instructions::refresh_reserve_ix(
                 &self.program_id,
                 reserve,
@@ -682,8 +700,17 @@ impl KlendClient {
 
         // 3. Build Refresh Reserve (for the current instruction - i.e. deposit, borrow)
         let ix_reserve_start = std::time::Instant::now();
-        for reserve_acc in instruction_reserves {
-            let reserve: Reserve = self.client.get_anchor_account(&reserve_acc).await.unwrap();
+        for reserve_acc in instruction_reserves.clone() {
+            // Use cache if available, otherwise fetch from RPC
+            let reserve_opt: Option<Reserve> = if let Some(cache) = reserve_cache {
+                cache.get(&reserve_acc).cloned()
+            } else {
+                self.client.get_anchor_account(&reserve_acc).await.ok()
+            };
+            let Some(reserve) = reserve_opt else {
+                tracing::warn!("Instruction reserve {} not found in cache or RPC", reserve_acc);
+                continue;
+            };
             let refresh_reserve_ix = instructions::refresh_reserve_ix(
                 &self.program_id,
                 reserve,
@@ -711,11 +738,16 @@ impl KlendClient {
 
         let farm_refresh_start = std::time::Instant::now();
         for (reserve_acc, farm_mode) in reserve_accts.iter().zip(farm_modes.iter()) {
-            let reserve: Reserve = self
-                .client
-                .get_anchor_account(&reserve_acc.key)
-                .await
-                .unwrap();
+            // Use cache if available, otherwise fetch from RPC
+            let reserve_opt: Option<Reserve> = if let Some(cache) = reserve_cache {
+                cache.get(&reserve_acc.key).cloned()
+            } else {
+                self.client.get_anchor_account(&reserve_acc.key).await.ok()
+            };
+            let Some(reserve) = reserve_opt else {
+                tracing::warn!("Farm reserve {} not found in cache or RPC", reserve_acc.key);
+                continue;
+            };
 
             let farm = reserve.get_farm(*farm_mode);
             println!(
@@ -884,6 +916,103 @@ pub async fn obligation_farms(
     };
 
     (obligation_farm_debt_account, obligation_farm_coll_account)
+}
+
+/// Batched version of obligation_farms that fetches both farm accounts in a single RPC call
+pub async fn obligation_farms_batched(
+    client: &RpcClient,
+    farm_debt: Pubkey,
+    farm_collateral: Pubkey,
+    obligation_address: Pubkey,
+) -> (
+    Option<StateWithKey<farms::state::UserState>>,
+    Option<StateWithKey<farms::state::UserState>>,
+) {
+    // Derive PDAs
+    let obligation_farm_debt_pda = if farm_debt != Pubkey::default() {
+        let (pda, _) = Pubkey::find_program_address(
+            &[
+                farms::utils::consts::BASE_SEED_USER_STATE,
+                farm_debt.as_ref(),
+                obligation_address.as_ref(),
+            ],
+            &farms::ID,
+        );
+        Some(pda)
+    } else {
+        None
+    };
+
+    let obligation_farm_coll_pda = if farm_collateral != Pubkey::default() {
+        let (pda, _) = Pubkey::find_program_address(
+            &[
+                farms::utils::consts::BASE_SEED_USER_STATE,
+                farm_collateral.as_ref(),
+                obligation_address.as_ref(),
+            ],
+            &farms::ID,
+        );
+        Some(pda)
+    } else {
+        None
+    };
+
+    // Collect pubkeys to fetch
+    let mut pubkeys_to_fetch: Vec<Pubkey> = Vec::new();
+    if let Some(pda) = obligation_farm_debt_pda {
+        pubkeys_to_fetch.push(pda);
+    }
+    if let Some(pda) = obligation_farm_coll_pda {
+        pubkeys_to_fetch.push(pda);
+    }
+
+    if pubkeys_to_fetch.is_empty() {
+        return (None, None);
+    }
+
+    // Batch fetch all accounts in one RPC call
+    let accounts = match client.get_multiple_accounts(&pubkeys_to_fetch).await {
+        Ok(accs) => accs,
+        Err(e) => {
+            tracing::warn!("Failed to batch fetch obligation farm accounts: {:?}", e);
+            return (None, None);
+        }
+    };
+
+    // Parse results
+    let mut debt_account = None;
+    let mut coll_account = None;
+    let mut idx = 0;
+
+    if let Some(debt_pda) = obligation_farm_debt_pda {
+        if let Some(Some(account)) = accounts.get(idx) {
+            // Try to deserialize as UserState (skip 8-byte discriminator)
+            if account.data.len() > 8 {
+                match farms::state::UserState::try_deserialize(&mut &account.data[..]) {
+                    Ok(user_state) => {
+                        debt_account = Some(StateWithKey::new(user_state, debt_pda));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    if let Some(coll_pda) = obligation_farm_coll_pda {
+        if let Some(Some(account)) = accounts.get(idx) {
+            if account.data.len() > 8 {
+                match farms::state::UserState::try_deserialize(&mut &account.data[..]) {
+                    Ok(user_state) => {
+                        coll_account = Some(StateWithKey::new(user_state, coll_pda));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    (debt_account, coll_account)
 }
 
 pub mod utils {

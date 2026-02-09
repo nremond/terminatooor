@@ -209,6 +209,22 @@ pub enum Actions {
         #[clap(flatten)]
         rebalance_args: RebalanceArgs,
     },
+
+    /// Profile instruction building latency for liquidations
+    /// Runs multiple iterations to measure wrap_obligation_instruction_with_farms timing
+    #[clap()]
+    ProfileIxBuilding {
+        /// Obligation to profile (must be a valid obligation with deposits and borrows)
+        #[clap(long, env, parse(try_from_str))]
+        obligation: Pubkey,
+
+        /// Number of iterations to run (default: 3)
+        #[clap(long, default_value = "3")]
+        iterations: usize,
+
+        #[clap(flatten)]
+        rebalance_args: RebalanceArgs,
+    },
 }
 
 #[tokio::main]
@@ -268,6 +284,11 @@ async fn main() -> Result<()> {
             market,
             rebalance_args: _,
         } => test_flash_liquidation(&klend_client, obligation.as_ref(), market.as_ref()).await,
+        Actions::ProfileIxBuilding {
+            obligation,
+            iterations,
+            rebalance_args: _,
+        } => profile_ix_building(&klend_client, &obligation, iterations).await,
     }
 }
 
@@ -463,6 +484,7 @@ async fn test_flash_liquidation(
             0, // min_acceptable_received_coll_amount
             None, // max_allowed_ltv_override
             false, // skip_post_farm_refresh = false (include post-farm refresh)
+            Some(reserves), // Pass cached reserves to avoid RPC calls
         )
         .await?;
 
@@ -615,6 +637,113 @@ async fn test_flash_liquidation(
     }
 
     info!("\n=== Test Complete ===");
+    Ok(())
+}
+
+/// Profile instruction building latency
+/// Runs multiple iterations of wrap_obligation_instruction_with_farms to measure timing
+async fn profile_ix_building(
+    klend_client: &Arc<KlendClient>,
+    obligation_pubkey: &Pubkey,
+    iterations: usize,
+) -> Result<()> {
+    info!("=== Profiling Instruction Building ===");
+    info!("Obligation: {}", obligation_pubkey);
+    info!("Iterations: {}", iterations);
+
+    // Fetch obligation
+    let obligation: Obligation = klend_client
+        .client
+        .get_anchor_account(obligation_pubkey)
+        .await?;
+    let market_key = obligation.lending_market;
+    info!("Market: {}", market_key);
+
+    // Load market and reserves
+    let market_accounts = klend_client.fetch_market_and_reserves(&market_key).await?;
+    let lending_market = StateWithKey::new(market_accounts.lending_market, market_key);
+    let reserves = &market_accounts.reserves;
+    info!("Found {} reserves", reserves.len());
+
+    // Find deposits and borrows
+    let deposits: Vec<_> = obligation
+        .deposits
+        .iter()
+        .filter(|d| d.deposit_reserve != Pubkey::default() && d.deposited_amount > 0)
+        .collect();
+    let borrows: Vec<_> = obligation
+        .borrows
+        .iter()
+        .filter(|b| b.borrow_reserve != Pubkey::default() && b.borrowed_amount_sf > 0)
+        .collect();
+
+    if deposits.is_empty() || borrows.is_empty() {
+        return Err(anyhow::anyhow!("Obligation has no deposits or borrows"));
+    }
+
+    // Use first deposit as collateral and first borrow as debt
+    let coll_reserve_key = deposits[0].deposit_reserve;
+    let debt_reserve_key = borrows[0].borrow_reserve;
+
+    let coll_reserve_data = reserves.get(&coll_reserve_key).ok_or_else(|| anyhow::anyhow!("Collateral reserve not found"))?.clone();
+    let debt_reserve_data = reserves.get(&debt_reserve_key).ok_or_else(|| anyhow::anyhow!("Debt reserve not found"))?.clone();
+
+    let coll_reserve = StateWithKey::new(coll_reserve_data, coll_reserve_key);
+    let debt_reserve = StateWithKey::new(debt_reserve_data, debt_reserve_key);
+    let obligation_state = StateWithKey::new(obligation.clone(), *obligation_pubkey);
+
+    info!("Collateral reserve: {}", coll_reserve_key);
+    info!("Debt reserve: {}", debt_reserve_key);
+
+    // Ensure ATAs exist for all reserve mints before building instructions
+    info!("Ensuring ATAs for reserves...");
+    klend_client
+        .liquidator
+        .ensure_atas_for_reserves(klend_client, reserves)
+        .await?;
+
+    // Calculate test liquidation amount
+    let borrowed_sf = borrows[0].borrowed_amount_sf;
+    let borrowed_amount: u64 = (borrowed_sf >> 60) as u64;
+    let liquidate_amount = std::cmp::max(borrowed_amount / 100, 1000);
+    info!("Test liquidation amount: {}", liquidate_amount);
+
+    info!("\n--- Running {} iterations ---", iterations);
+    let mut times = Vec::with_capacity(iterations);
+
+    for i in 0..iterations {
+        info!("\n=== Iteration {} ===", i + 1);
+        let start = std::time::Instant::now();
+
+        // This is what we're profiling - it calls wrap_obligation_instruction_with_farms internally
+        let _liquidate_ixns = klend_client
+            .liquidate_obligation_and_redeem_reserve_collateral_ixns(
+                lending_market.clone(),
+                debt_reserve.clone(),
+                coll_reserve.clone(),
+                obligation_state.clone(),
+                liquidate_amount,
+                1, // min_acceptable_received_coll_amount
+                Some(10), // max_allowed_ltv_override_pct
+                false, // skip_post_farm_refresh
+                Some(reserves), // Pass cached reserves to avoid RPC calls
+            )
+            .await?;
+
+        let elapsed = start.elapsed();
+        info!("Iteration {} total: {}ms", i + 1, elapsed.as_millis());
+        times.push(elapsed.as_millis() as u64);
+    }
+
+    // Print summary statistics
+    info!("\n=== Summary ===");
+    let avg = times.iter().sum::<u64>() / times.len() as u64;
+    let min = times.iter().min().unwrap();
+    let max = times.iter().max().unwrap();
+    info!("Times: {:?}ms", times);
+    info!("Average: {}ms", avg);
+    info!("Min: {}ms, Max: {}ms", min, max);
+
     Ok(())
 }
 
@@ -1080,6 +1209,7 @@ async fn liquidate_fast(
         let parallel_start = std::time::Instant::now();
 
         let log_prefix_owned = log_prefix.to_string();
+        let reserves_for_cache = reserves.clone();
         let liquidate_ixns_future = async {
             let start = std::time::Instant::now();
             let result = klend_client.liquidate_obligation_and_redeem_reserve_collateral_ixns(
@@ -1091,6 +1221,7 @@ async fn liquidate_fast(
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
                 false, // Must include post-farm refresh for on-chain validation
+                Some(&reserves_for_cache), // Pass cached reserves to avoid RPC calls
             ).await;
             debug!("{} Liquidation ixns built in {}ms", log_prefix_owned, start.elapsed().as_millis());
             result

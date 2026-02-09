@@ -1075,10 +1075,14 @@ async fn liquidate_fast(
         // Flash borrow is at index 0 in our list, but build_with_budget_and_fee prepends ComputeBudget ixs
         let flash_borrow_index = instructions::flash_borrow_instruction_index(0);
 
-        // 2. Build liquidation instructions (use original obligation, not the simulation-mutated one)
-        // Include post-farm refresh - required by on-chain check_refresh validation
-        let liquidate_ixns = klend_client
-            .liquidate_obligation_and_redeem_reserve_collateral_ixns(
+        // 2. Build liquidation instructions AND get swap quote in PARALLEL
+        // This saves ~200-350ms by overlapping the instruction building RPC calls with the Metis API call
+        let parallel_start = std::time::Instant::now();
+
+        let log_prefix_owned = log_prefix.to_string();
+        let liquidate_ixns_future = async {
+            let start = std::time::Instant::now();
+            let result = klend_client.liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
                 debt_reserve.clone(),
                 coll_reserve.clone(),
@@ -1087,26 +1091,47 @@ async fn liquidate_fast(
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
                 false, // Must include post-farm refresh for on-chain validation
-            )
-            .await?;
+            ).await;
+            debug!("{} Liquidation ixns built in {}ms", log_prefix_owned, start.elapsed().as_millis());
+            result
+        };
+
+        // Only fetch swap if collateral != debt (need to swap back)
+        let needs_swap = coll_mint != debt_mint;
+        let log_prefix_owned2 = log_prefix.to_string();
+        let swap_future = async {
+            if needs_swap {
+                let start = std::time::Instant::now();
+                let result = get_best_swap_instructions(
+                    &coll_mint,
+                    &debt_mint,
+                    expected_collateral,
+                    true, // only_direct_routes
+                    Some(100), // slippage_bps
+                    Some(5.0), // price_impact_limit
+                    user,
+                    &klend_client.client.client,
+                    None,
+                    None,
+                ).await;
+                debug!("{} Swap quote fetched in {}ms", log_prefix_owned2, start.elapsed().as_millis());
+                Some(result)
+            } else {
+                None
+            }
+        };
+
+        // Run both in parallel
+        let (liquidate_ixns_result, swap_result_opt) = tokio::join!(liquidate_ixns_future, swap_future);
+        info!("{} Parallel build completed in {}ms", log_prefix, parallel_start.elapsed().as_millis());
+
+        // Handle liquidation instructions result
+        let liquidate_ixns = liquidate_ixns_result?;
         ixns.extend_from_slice(&liquidate_ixns);
 
-        // 3. Swap collateral back to debt token (if different)
-        if coll_mint != debt_mint {
-            let swap_result = match get_best_swap_instructions(
-                &coll_mint,
-                &debt_mint,
-                expected_collateral,
-                true, // only_direct_routes
-                Some(100), // slippage_bps
-                Some(5.0), // price_impact_limit
-                user,
-                &klend_client.client.client,
-                None,
-                None,
-            )
-            .await
-            {
+        // 3. Handle swap result (if we needed a swap)
+        if needs_swap {
+            let swap_result = match swap_result_opt.unwrap() {
                 Ok(result) => result,
                 Err(e) => {
                     let err_str = format!("{:?}", e);

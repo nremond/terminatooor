@@ -485,6 +485,7 @@ async fn test_flash_liquidation(
             None, // max_allowed_ltv_override
             false, // skip_post_farm_refresh = false (include post-farm refresh)
             Some(reserves), // Pass cached reserves to avoid RPC calls
+            None, // No farm cache - will fetch via RPC
         )
         .await?;
 
@@ -708,7 +709,25 @@ async fn profile_ix_building(
     let liquidate_amount = std::cmp::max(borrowed_amount / 100, 1000);
     info!("Test liquidation amount: {}", liquidate_amount);
 
-    info!("\n--- Running {} iterations ---", iterations);
+    // Pre-fetch farm user states once (simulating what liquidate_fast does)
+    info!("Pre-fetching farm user states...");
+    let prefetch_start = std::time::Instant::now();
+    let debt_res_ref = debt_reserve.state.borrow();
+    let coll_res_ref = coll_reserve.state.borrow();
+    let reserves_for_prefetch: Vec<(&Pubkey, &Reserve)> = vec![
+        (&debt_reserve_key, &*debt_res_ref),
+        (&coll_reserve_key, &*coll_res_ref),
+    ];
+    let farm_cache = client::prefetch_farm_user_states(
+        &klend_client.client.client,
+        obligation_pubkey,
+        &reserves_for_prefetch,
+    ).await;
+    drop(debt_res_ref);
+    drop(coll_res_ref);
+    info!("Pre-fetched {} farm user states in {}ms", farm_cache.len(), prefetch_start.elapsed().as_millis());
+
+    info!("\n--- Running {} iterations (with farm cache) ---", iterations);
     let mut times = Vec::with_capacity(iterations);
 
     for i in 0..iterations {
@@ -727,6 +746,7 @@ async fn profile_ix_building(
                 Some(10), // max_allowed_ltv_override_pct
                 false, // skip_post_farm_refresh
                 Some(reserves), // Pass cached reserves to avoid RPC calls
+                Some(&farm_cache), // Pass pre-fetched farm user states
             )
             .await?;
 
@@ -736,7 +756,7 @@ async fn profile_ix_building(
     }
 
     // Print summary statistics
-    info!("\n=== Summary ===");
+    info!("\n=== Summary (with all caches) ===");
     let avg = times.iter().sum::<u64>() / times.len() as u64;
     let min = times.iter().min().unwrap();
     let max = times.iter().max().unwrap();
@@ -1208,6 +1228,22 @@ async fn liquidate_fast(
         // This saves ~200-350ms by overlapping the instruction building RPC calls with the Metis API call
         let parallel_start = std::time::Instant::now();
 
+        // Pre-fetch farm user states to eliminate ~60ms RPC latency during instruction building
+        let debt_res_ref = debt_reserve.state.borrow();
+        let coll_res_ref = coll_reserve.state.borrow();
+        let reserves_for_prefetch: Vec<(&Pubkey, &Reserve)> = vec![
+            (&debt_res_key, &*debt_res_ref),
+            (&coll_res_key, &*coll_res_ref),
+        ];
+        let farm_cache = client::prefetch_farm_user_states(
+            &klend_client.client.client,
+            obligation_pubkey,
+            &reserves_for_prefetch,
+        ).await;
+        drop(debt_res_ref);
+        drop(coll_res_ref);
+        debug!("{} Pre-fetched {} farm user states in {}ms", log_prefix, farm_cache.len(), parallel_start.elapsed().as_millis());
+
         let log_prefix_owned = log_prefix.to_string();
         let reserves_for_cache = reserves.clone();
         let liquidate_ixns_future = async {
@@ -1222,6 +1258,7 @@ async fn liquidate_fast(
                 max_allowed_ltv_override_pct_opt,
                 false, // Must include post-farm refresh for on-chain validation
                 Some(&reserves_for_cache), // Pass cached reserves to avoid RPC calls
+                Some(&farm_cache), // Pass pre-fetched farm user states to avoid RPC calls
             ).await;
             debug!("{} Liquidation ixns built in {}ms", log_prefix_owned, start.elapsed().as_millis());
             result

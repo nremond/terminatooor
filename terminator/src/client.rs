@@ -492,6 +492,8 @@ impl KlendClient {
     ///   to reduce transaction size. Use for flash loan liquidations.
     /// * `reserve_cache` - Optional cache of reserves to avoid RPC fetches. Pass reserves from
     ///   market state to eliminate ~100ms of RPC latency.
+    /// * `farm_cache` - Optional cache of pre-fetched farm UserState accounts. Pass result of
+    ///   prefetch_farm_user_states() to eliminate ~60ms of RPC latency.
     #[allow(clippy::too_many_arguments)]
     pub async fn liquidate_obligation_and_redeem_reserve_collateral_ixns(
         &self,
@@ -504,6 +506,7 @@ impl KlendClient {
         max_allowed_ltv_override_pct_opt: Option<u64>,
         skip_post_farm_refresh: bool,
         reserve_cache: Option<&HashMap<Pubkey, Reserve>>,
+        farm_cache: Option<&FarmUserStateCache>,
     ) -> Result<Vec<Instruction>> {
         let liquidate_ix = instructions::liquidate_obligation_and_redeem_reserve_collateral_ix(
             &self.program_id,
@@ -525,6 +528,7 @@ impl KlendClient {
                 &self.liquidator.wallet.clone(),
                 skip_post_farm_refresh,
                 reserve_cache,
+                farm_cache,
             )
             .await;
 
@@ -562,6 +566,7 @@ impl KlendClient {
                 max_allowed_ltv_override_pct_opt,
                 false, // Include post farm refresh for non-flash loan liquidations
                 None, // No reserve cache available in this code path
+                None, // No farm cache available in this code path
             )
             .await?;
 
@@ -581,6 +586,8 @@ impl KlendClient {
     /// * `reserve_cache` - Optional cache of reserves to avoid RPC fetches. If None, will fetch from RPC.
     /// * `skip_post_farm_refresh` - If true, skips post-liquidation farm refresh to reduce tx size.
     ///   Use this for flash loan liquidations where the tx is already at the size limit.
+    /// * `farm_cache` - Optional cache of pre-fetched farm UserState accounts. Pass result of
+    ///   prefetch_farm_user_states() to eliminate ~60ms of RPC latency.
     pub async fn wrap_obligation_instruction_with_farms(
         &self,
         reserve_accts: &[&StateWithKey<Reserve>],
@@ -589,6 +596,7 @@ impl KlendClient {
         payer: &Arc<Keypair>,
         skip_post_farm_refresh: bool,
         reserve_cache: Option<&HashMap<Pubkey, Reserve>>,
+        farm_cache: Option<&FarmUserStateCache>,
     ) -> (Vec<InstructionBlocks>, Vec<InstructionBlocks>) {
         // If has farms, also do init farm obligations
         // Always do refresh_reserve
@@ -630,11 +638,18 @@ impl KlendClient {
                 )
             };
             let farm_start = std::time::Instant::now();
-            // Use batched version for single RPC call instead of multiple sequential calls
-            let (obligation_farm_debt, obligation_farm_coll) =
+
+            // Use pre-fetched cache if available, otherwise fetch via RPC
+            let (obligation_farm_debt, obligation_farm_coll) = if let Some(cache) = farm_cache {
+                let debt = lookup_farm_user_state(cache, &farm_debt, &obligation_address);
+                let coll = lookup_farm_user_state(cache, &farm_collateral, &obligation_address);
+                (debt, coll)
+            } else {
+                // Fallback to batched RPC call
                 obligation_farms_batched(&self.client.client, farm_debt, farm_collateral, obligation_address)
-                    .await;
-            tracing::debug!("  obligation_farms: {}ms", farm_start.elapsed().as_millis());
+                    .await
+            };
+            tracing::debug!("  obligation_farms: {}ms (cached={})", farm_start.elapsed().as_millis(), farm_cache.is_some());
 
             if farm_debt != Pubkey::default() && obligation_farm_debt.is_none() {
                 let init_obligation_farm_ix = instructions::init_obligation_farm_for_reserve_ix(
@@ -1013,6 +1028,99 @@ pub async fn obligation_farms_batched(
     }
 
     (debt_account, coll_account)
+}
+
+/// Cache of pre-fetched farm UserState accounts, keyed by the UserState PDA
+/// Value is Option<UserState> - Some if account exists, None if it doesn't exist
+pub type FarmUserStateCache = HashMap<Pubkey, Option<farms::state::UserState>>;
+
+/// Derive farm UserState PDA for an obligation and farm
+pub fn derive_farm_user_state_pda(farm: &Pubkey, obligation: &Pubkey) -> Pubkey {
+    let (pda, _) = Pubkey::find_program_address(
+        &[
+            farms::utils::consts::BASE_SEED_USER_STATE,
+            farm.as_ref(),
+            obligation.as_ref(),
+        ],
+        &farms::ID,
+    );
+    pda
+}
+
+/// Pre-fetch all farm UserState accounts for an obligation's reserves in a single RPC call.
+/// Returns a cache that can be passed to wrap_obligation_instruction_with_farms.
+pub async fn prefetch_farm_user_states(
+    client: &RpcClient,
+    obligation_address: &Pubkey,
+    reserves: &[(&Pubkey, &Reserve)],
+) -> FarmUserStateCache {
+    let mut cache = FarmUserStateCache::new();
+    let mut pdas_to_fetch: Vec<Pubkey> = Vec::new();
+    let mut pda_info: Vec<Pubkey> = Vec::new(); // Track which PDA is at which index
+
+    // Collect all farm PDAs for both debt and collateral modes
+    for (_, reserve) in reserves {
+        let farm_debt = reserve.get_farm(ReserveFarmKind::Debt);
+        let farm_coll = reserve.get_farm(ReserveFarmKind::Collateral);
+
+        if farm_debt != Pubkey::default() {
+            let pda = derive_farm_user_state_pda(&farm_debt, obligation_address);
+            if !pdas_to_fetch.contains(&pda) {
+                pdas_to_fetch.push(pda);
+                pda_info.push(pda);
+            }
+        }
+
+        if farm_coll != Pubkey::default() {
+            let pda = derive_farm_user_state_pda(&farm_coll, obligation_address);
+            if !pdas_to_fetch.contains(&pda) {
+                pdas_to_fetch.push(pda);
+                pda_info.push(pda);
+            }
+        }
+    }
+
+    if pdas_to_fetch.is_empty() {
+        return cache;
+    }
+
+    // Batch fetch all PDAs in one RPC call
+    match client.get_multiple_accounts(&pdas_to_fetch).await {
+        Ok(accounts) => {
+            for (i, account_opt) in accounts.iter().enumerate() {
+                let pda = pda_info[i];
+                let user_state = account_opt.as_ref().and_then(|acc| {
+                    if acc.data.len() > 8 {
+                        farms::state::UserState::try_deserialize(&mut &acc.data[..]).ok()
+                    } else {
+                        None
+                    }
+                });
+                cache.insert(pda, user_state);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to prefetch farm user states: {:?}", e);
+        }
+    }
+
+    tracing::debug!("Pre-fetched {} farm user states", cache.len());
+    cache
+}
+
+/// Look up a farm UserState from the cache, returning StateWithKey if found
+pub fn lookup_farm_user_state(
+    cache: &FarmUserStateCache,
+    farm: &Pubkey,
+    obligation: &Pubkey,
+) -> Option<StateWithKey<farms::state::UserState>> {
+    if *farm == Pubkey::default() {
+        return None;
+    }
+    let pda = derive_farm_user_state_pda(farm, obligation);
+    cache.get(&pda).and_then(|opt| {
+        opt.as_ref().map(|state| StateWithKey::new(*state, pda))
+    })
 }
 
 pub mod utils {

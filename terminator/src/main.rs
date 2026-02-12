@@ -6,7 +6,6 @@ use anchor_lang::AccountDeserialize;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use consts::WRAPPED_SOL_MINT;
 use itertools::Itertools;
 use crate::routing::DecompiledVersionedTx;
 use bytemuck::try_from_bytes;
@@ -21,19 +20,17 @@ use tracing_subscriber::filter::EnvFilter;
 
 use crate::{
     accounts::{map_accounts_and_create_infos, oracle_accounts, OracleAccounts},
-    client::{KlendClient, RebalanceConfig},
+    client::KlendClient,
     config::get_lending_markets,
     geyser::{GeyserConfig, GeyserStream},
     routing::{get_best_swap_instructions, SwapResult},
-    liquidator::{Holding, Holdings},
+    liquidator::Holdings,
     math::{LiquidationStrategy, Fraction},
     model::StateWithKey,
     operations::{
         obligation_reserves, referrer_token_states_of_obligation, split_obligations,
         ObligationReserves, SplitObligations,
     },
-    px::fetch_prices,
-    utils::get_all_reserve_mints,
 };
 
 pub mod accounts;
@@ -50,10 +47,7 @@ pub mod math;
 pub mod metis;
 mod model;
 pub mod operations;
-mod px;
 pub mod sysvars;
-pub mod titan;  // Keep for now, will remove after Metis is confirmed working
-mod utils;
 pub mod parallel;
 
 const USDC_MINT_STR: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -166,34 +160,6 @@ pub enum Actions {
         #[clap(long, env = "LIQUIDATION_COOLDOWN_SECS", default_value = "5")]
         cooldown_secs: u64,
     },
-    #[clap()]
-    Swap {
-        /// From token
-        #[clap(long, env, parse(try_from_str))]
-        from: Pubkey,
-
-        /// From token
-        #[clap(long, env, parse(try_from_str))]
-        to: Pubkey,
-
-        /// From token
-        #[clap(long, env, parse(try_from_str))]
-        amount: f64,
-
-        /// From token
-        #[clap(long, env, parse(try_from_str))]
-        slippage_pct: f64,
-
-        #[clap(flatten)]
-        rebalance_args: RebalanceArgs,
-    },
-
-    #[clap()]
-    Rebalance {
-        #[clap(flatten)]
-        rebalance_args: RebalanceArgs,
-    },
-
     /// Test flash loan liquidation by simulating a transaction for a specific obligation
     /// This is useful for debugging error 2502 without waiting for real opportunities
     #[clap()]
@@ -271,14 +237,6 @@ async fn main() -> Result<()> {
             };
             crank_stream(klend_client.clone(), geyser_endpoint, geyser_api_key, state_refresh_hours, parallel_config).await
         }
-        Actions::Swap {
-            from,
-            to,
-            amount,
-            slippage_pct,
-            rebalance_args: _,
-        } => swap::swap_action(&klend_client, from, to, amount, slippage_pct).await,
-        Actions::Rebalance { rebalance_args: _ } => rebalance(&klend_client).await,
         Actions::TestFlashLiquidation {
             obligation,
             market,
@@ -765,249 +723,6 @@ async fn profile_ix_building(
     info!("Min: {}ms, Max: {}ms", min, max);
 
     Ok(())
-}
-
-async fn rebalance(klend_client: &Arc<KlendClient>) -> Result<()> {
-    let lending_markets = get_lending_markets(klend_client).await?;
-
-    info!("Rebalancing...");
-    let rebalance_config = match &klend_client.rebalance_config {
-        None => Err(anyhow::anyhow!("Rebalance settings not found")),
-        Some(c) => Ok(c),
-    }?;
-    let RebalanceConfig {
-        base_token,
-        min_sol_balance,
-        rebalance_slippage_pct: slippage,
-        ..
-    } = rebalance_config;
-    info!(
-        "Loading markets and reserves for {} markets..",
-        lending_markets.len()
-    );
-    let markets =
-        crate::client::utils::fetch_markets_and_reserves(klend_client, &lending_markets).await?;
-    let (all_reserves, _ctoken_mints, liquidity_mints) = get_all_reserve_mints(&markets);
-    info!("Loading prices via Titan..");
-    let amount = 100.0;
-    let pxs = fetch_prices(&liquidity_mints, &rebalance_config.usdc_mint, amount).await?;
-    info!("Loading holdings..");
-    let mut holdings = klend_client
-        .liquidator
-        .fetch_holdings(&klend_client.client.client, &all_reserves, &pxs)
-        .await?;
-
-    let base = holdings.holding_of(base_token).unwrap();
-    info!(
-        "Base {:?} {} holding {}",
-        base.mint, base.label, base.ui_balance
-    );
-    let sol_holding = &holdings.sol;
-    info!(
-        "SOL holding {}, Min sol holding {}",
-        sol_holding.ui_balance, min_sol_balance
-    );
-
-    // Rules:
-    // - if sol_balance < min_sol -> base token swaps into min_sol balance at least
-    // - if sol_balance > min_sol * 2 -> swap the diff from current_sol - min_sol * 2 -> base token
-    // - every non base token goes into base token if > $1 -> swap it partially at most $20k at a time
-
-    const SOL_BUFFER_FACTOR: f64 = 2.0;
-    let sol_balance = sol_holding.ui_balance;
-
-    if sol_balance < *min_sol_balance {
-        // Swap base token into SOL to reach min sol balance
-        let target = min_sol_balance * SOL_BUFFER_FACTOR;
-        let missing = target - sol_balance;
-
-        let px_sol_to_base = pxs.a_to_b(&WRAPPED_SOL_MINT, base_token);
-        let base_to_swap = missing * px_sol_to_base * (1.0 + slippage / 100.0);
-
-        info!("Sol balance {} is below min_balance {} so we are topping up to {}, therefore acquiring {} more SOL, sol_price_to_base {}, swapping base {}",
-            sol_balance,
-            min_sol_balance,
-            target,
-            missing,
-            px_sol_to_base,
-            base_to_swap
-        );
-
-        // TODO: make these ixns go together
-        swap::swap(
-            klend_client,
-            &holdings,
-            base_token,
-            &sol_holding.mint,
-            base_to_swap,
-            *slippage,
-        )
-        .await?;
-
-        let _ = accounts::unwrap_wsol_ata(klend_client).await?;
-
-        // Reload holdings
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        holdings = klend_client
-            .liquidator
-            .fetch_holdings(&klend_client.client.client, &all_reserves, &pxs)
-            .await?;
-    }
-
-    // TODO: If we have too much wsol and it's not the base asset
-    // then just unwrap it
-    // accounts::unwrap_wsol_ata(klend_client).await;
-    if rebalance_config.base_token != WRAPPED_SOL_MINT {
-        let wsol_holding = holdings.holding_of(&WRAPPED_SOL_MINT).unwrap();
-        if wsol_holding.usd_value > 1.0 {
-            info!("Unwrapping {} WSOL", wsol_holding.ui_balance);
-            let _ = accounts::unwrap_wsol_ata(klend_client).await?;
-
-            // Reload holdings
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            klend_client
-                .liquidator
-                .fetch_holdings(&klend_client.client.client, &all_reserves, &pxs)
-                .await?;
-        }
-    }
-
-    // Now swap the remaining
-    for Holding {
-        mint,
-        ui_balance,
-        usd_value,
-        label,
-        ..
-    } in holdings.holdings.clone().into_iter()
-    {
-        if &mint == base_token {
-            continue;
-        }
-
-        if usd_value < rebalance_config.non_swappable_dust_usd_value {
-            // We don't swap it, too small
-            continue;
-        }
-
-        // Swap the whole thing
-        let px = pxs.a_to_b(&mint, base_token);
-        let estimated_base = ui_balance * px * (1.0 + slippage / 100.0);
-        info!(
-            "Swapping non-base token {} amount: {} expecting back {} base",
-            label, ui_balance, estimated_base
-        );
-
-        swap::swap(
-            klend_client,
-            &holdings,
-            &mint,
-            base_token,
-            ui_balance,
-            *slippage,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-pub mod swap {
-    use super::*;
-
-    pub async fn swap_action(
-        klend_client: &Arc<KlendClient>,
-        from: Pubkey,
-        to: Pubkey,
-        amount: f64,
-        slippage_pct: f64,
-    ) -> Result<()> {
-        let rebalance_config = match &klend_client.rebalance_config {
-            None => Err(anyhow::anyhow!("Rebalance settings not found")),
-            Some(c) => Ok(c),
-        }?;
-
-        let lending_markets = get_lending_markets(klend_client).await?;
-        let markets =
-            client::utils::fetch_markets_and_reserves(klend_client, &lending_markets).await?;
-        let (reserves, _, l_mints) = get_all_reserve_mints(&markets);
-        let pxs = fetch_prices(&l_mints, &rebalance_config.usdc_mint, amount as f32).await?;
-        let holdings = klend_client
-            .liquidator
-            .fetch_holdings(&klend_client.client.client, &reserves, &pxs)
-            .await?;
-        swap(klend_client, &holdings, &from, &to, amount, slippage_pct).await
-    }
-
-    pub async fn swap(
-        klend_client: &KlendClient,
-        holdings: &Holdings,
-        from: &Pubkey,
-        to: &Pubkey,
-        amount: f64,
-        slippage_pct: f64,
-    ) -> Result<()> {
-        // Titan swap API quote request
-
-        let from_token = holdings.holding_of(from)?;
-        let to_token = holdings.holding_of(to)?;
-        let user = klend_client.liquidator.wallet.pubkey();
-
-        info!(
-            "Swapping {} {} for {} with slippage {}%",
-            amount,
-            from_token.label.to_string().green(),
-            to_token.label.to_string().green(),
-            slippage_pct
-        );
-
-        let amount_to_swap = (amount * 10f64.powf(from_token.decimals as f64)).floor() as u64;
-        let slippage_bps = (slippage_pct * 100f64).floor() as u16;
-
-        let swap_result = get_best_swap_instructions(
-            from,
-            to,
-            amount_to_swap,
-            false,
-            Some(slippage_bps),
-            None,
-            user,
-            &klend_client.client.client,
-            None,
-            None,
-        )
-        .await?;
-
-        info!(
-            "Swap quote: in={} out={} (slippage={}bps)",
-            swap_result.route.in_amount,
-            swap_result.route.out_amount,
-            swap_result.route.slippage_bps
-        );
-
-        let DecompiledVersionedTx {
-            lookup_tables,
-            instructions: jup_ixs,
-        } = swap_result.tx;
-
-        let mut builder = klend_client.client.tx_builder().add_ixs(jup_ixs);
-
-        if let Some(lookup_tables) = lookup_tables {
-            for table in lookup_tables.into_iter() {
-                builder = builder.add_lookup_table(table);
-            }
-        }
-
-        let tx = builder.build(&[]).await?;
-
-        info!("Sending transaction...");
-        let (sig, _) = klend_client
-            .client
-            .send_retry_and_confirm_transaction(tx, None, false)
-            .await?;
-        info!("Executed transaction: {:?}", sig);
-
-        Ok(())
-    }
 }
 
 /// Fast liquidation path for streaming mode - uses cached data to minimize RPC calls

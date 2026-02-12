@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::{Arc, RwLock}, time::Duration};
 use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
 use anchor_lang::{prelude::Pubkey, solana_program::program_pack::Pack, AccountDeserialize, Id};
 use anchor_spl::token::{Mint, Token};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use kamino_lending::Reserve;
 use solana_sdk::{signature::Keypair, signer::Signer};
 use spl_associated_token_account::{
@@ -13,7 +13,7 @@ use spl_associated_token_account::{
 use spl_token::state::Account as TokenAccount;
 use tracing::{debug, info, warn};
 
-use crate::{accounts::find_account, client::KlendClient, consts::WRAPPED_SOL_MINT, px::Prices};
+use crate::{accounts::find_account, client::KlendClient};
 
 #[derive(Debug, Clone, Default)]
 pub struct Holdings {
@@ -32,37 +32,12 @@ pub struct Holding {
     pub usd_value: f64,
 }
 
-impl Holdings {
-    pub fn holding_of(&self, mint: &Pubkey) -> Result<Holding> {
-        for holding in self.holdings.iter() {
-            if holding.mint == *mint {
-                return Ok(holding.clone());
-            }
-        }
-        Err(anyhow!("Holding not found for mint {}", mint))
-    }
-}
-
 #[derive(Debug)]
 pub struct Liquidator {
     pub wallet: Arc<Keypair>,
     pub atas: RwLock<HashMap<Pubkey, Pubkey>>,
     /// Maps mint -> token program (SPL Token or Token2022)
     pub mint_token_programs: RwLock<HashMap<Pubkey, Pubkey>>,
-}
-
-fn label_of(mint: &Pubkey, reserves: &HashMap<Pubkey, Reserve>) -> String {
-    for (_, reserve) in reserves.iter() {
-        if &reserve.liquidity.mint_pubkey == mint {
-            let symbol = reserve.config.token_info.symbol().to_string();
-            if symbol == "SOL" {
-                return "WSOL".to_string();
-            } else {
-                return symbol;
-            }
-        }
-    }
-    mint.to_string()
 }
 
 impl Liquidator {
@@ -258,116 +233,6 @@ impl Liquidator {
             .get(mint)
             .copied()
             .unwrap_or(Token::id())
-    }
-
-    pub async fn fetch_holdings(
-        &self,
-        client: &RpcClient,
-        reserves: &HashMap<Pubkey, Reserve>,
-        prices: &Prices,
-    ) -> Result<Holdings> {
-        let mut holdings = Vec::new();
-
-        // Get a snapshot of atas
-        let atas_snapshot: Vec<(Pubkey, Pubkey)> = {
-            let atas = self.atas.read().unwrap();
-            atas.iter().map(|(m, a)| (*m, *a)).collect()
-        };
-
-        // Batch fetch all mint and ATA accounts in single RPC calls
-        let mint_pubkeys: Vec<Pubkey> = atas_snapshot.iter().map(|(m, _)| *m).collect();
-        let ata_pubkeys: Vec<Pubkey> = atas_snapshot.iter().map(|(_, a)| *a).collect();
-
-        let mint_accounts = client.get_multiple_accounts(&mint_pubkeys).await?;
-        let ata_accounts = client.get_multiple_accounts(&ata_pubkeys).await?;
-
-        for (i, (mint, ata)) in atas_snapshot.iter().enumerate() {
-            let mint_account = mint_accounts.get(i).and_then(|a| a.as_ref());
-            let ata_account = ata_accounts.get(i).and_then(|a| a.as_ref());
-
-            match (mint_account, ata_account) {
-                (Some(mint_acc), Some(ata_acc)) => {
-                    // Try to unpack as SPL Token account
-                    // For Token-2022 accounts with extensions, data is longer than 165 bytes
-                    // but the base Account struct is the same, so we can read just the first 165 bytes
-                    let token_account = if ata_acc.data.len() >= 165 {
-                        match TokenAccount::unpack(&ata_acc.data[..165]) {
-                            Ok(acc) => acc,
-                            Err(_) => {
-                                // Likely uninitialized (ATA exists but never received tokens)
-                                // Balance is 0, skip silently
-                                continue;
-                            }
-                        }
-                    } else {
-                        // Data too short - account is invalid or uninitialized
-                        continue;
-                    };
-                    // SPL Token Mint is 82 bytes, Token-2022 mints may have extensions
-                    // Use spl_token's unpack which handles this correctly
-                    let decimals = if mint_acc.data.len() >= 82 {
-                        match spl_token::state::Mint::unpack(&mint_acc.data[..82]) {
-                            Ok(m) => m.decimals,
-                            Err(_) => {
-                                // Likely a cToken or other non-standard mint, skip silently
-                                continue;
-                            }
-                        }
-                    } else {
-                        // Data too short for a valid mint
-                        continue;
-                    };
-                    let balance = token_account.amount;
-                    let ui_balance = balance as f64 / 10u64.pow(decimals as u32) as f64;
-                    holdings.push(Holding {
-                        mint: *mint,
-                        ata: *ata,
-                        decimals,
-                        balance,
-                        ui_balance,
-                        label: label_of(mint, reserves),
-                        usd_value: if balance > 0 {
-                            prices
-                                .prices
-                                .get(mint)
-                                .map_or(0.0, |price| ui_balance * price)
-                        } else {
-                            0.0
-                        },
-                    });
-                }
-                _ => {
-                    // ATA doesn't exist yet, skip silently
-                }
-            }
-        }
-
-        // Load SOL balance
-        let balance = client.get_balance(&self.wallet.pubkey()).await?;
-        let ui_balance = balance as f64 / 10u64.pow(9) as f64;
-        let sol_price = prices.prices.get(&WRAPPED_SOL_MINT).copied().unwrap_or(0.0);
-        let sol_holding = Holding {
-            mint: Pubkey::default(), // No mint, this is the native balance
-            ata: Pubkey::default(),  // Holding in the native account, not in the ata
-            decimals: 9,
-            balance,
-            ui_balance,
-            label: "SOL".to_string(),
-            usd_value: ui_balance * sol_price,
-        };
-        info!("Holding {} SOL", sol_holding.ui_balance);
-
-        for holding in holdings.iter() {
-            if holding.balance > 0 {
-                info!("Holding {} {}", holding.ui_balance, holding.label);
-            }
-        }
-
-        let holding = Holdings {
-            holdings,
-            sol: sol_holding,
-        };
-        Ok(holding)
     }
 }
 

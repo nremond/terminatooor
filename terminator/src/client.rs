@@ -35,13 +35,11 @@ use tracing::{info, warn};
 
 use crate::{
     accounts::{find_account, market_and_reserve_accounts, MarketAccounts},
-    consts::{NULL_PUBKEY, WRAPPED_SOL_MINT},
+    consts::NULL_PUBKEY,
     instructions::{self, InstructionBlocks},
     liquidator::Liquidator,
     lookup_tables::collect_keys,
     model::StateWithKey,
-    px,
-    px::Prices,
 };
 
 pub struct KlendClient {
@@ -459,30 +457,6 @@ impl KlendClient {
                 return Ok((sig, res));
             }
         }
-    }
-
-    pub async fn fetch_all_prices(
-        &mut self,
-        reserves: &[Reserve],
-        usd_mint: &Pubkey,
-    ) -> Result<Prices> {
-        let mut mints = reserves
-            .iter()
-            .map(|x| x.liquidity.mint_pubkey)
-            .collect::<HashSet<Pubkey>>();
-
-        if let Some(c) = &self.rebalance_config {
-            mints.insert(c.base_token);
-            mints.insert(c.usdc_mint);
-        };
-        mints.insert(WRAPPED_SOL_MINT);
-
-        // Convert mints to vec
-        let mints = mints.into_iter().collect::<Vec<Pubkey>>();
-
-        // TOOD: fix amount to be per token
-        let amount = 100.0;
-        px::fetch_prices(&mints, usd_mint, amount).await
     }
 
     /// Build liquidation instructions with optional post-farm refresh.

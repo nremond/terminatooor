@@ -1461,7 +1461,7 @@ async fn liquidate_fast(
         );
 
         // Skip simulation and submit directly for faster execution
-        info!("{} Skipping simulation for faster execution", log_prefix);
+        debug!("{} Skipping simulation for faster execution", log_prefix);
 
         let should_send = true;
 

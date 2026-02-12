@@ -13,6 +13,7 @@ use kamino_lending::{Obligation, Reserve, ReserveFarmKind};
 use solana_sdk::{
     compute_budget::{self},
     signer::Signer,
+    transaction::VersionedTransaction,
 };
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -23,6 +24,7 @@ use crate::{
     client::KlendClient,
     config::get_lending_markets,
     geyser::{GeyserConfig, GeyserStream},
+    jito::{JitoClient, JitoConfig},
     routing::{get_best_swap_instructions, SwapResult},
     liquidator::Holdings,
     math::{LiquidationStrategy, Fraction},
@@ -33,12 +35,23 @@ use crate::{
     },
 };
 
+lazy_static::lazy_static! {
+    static ref JITO_CLIENT: JitoClient = {
+        let config = JitoConfig::from_env();
+        if config.enabled {
+            info!("Jito bundle submission enabled (tip: {} lamports)", config.tip_lamports);
+        }
+        JitoClient::new(config)
+    };
+}
+
 pub mod accounts;
 pub mod client;
 mod config;
 pub mod consts;
 pub mod geyser;
 pub mod instructions;
+pub mod jito;
 pub mod routing;
 pub mod liquidator;
 pub mod lookup_tables;
@@ -1183,6 +1196,16 @@ async fn liquidate_fast(
         }
         debug!("{}   Note: liquidate_ixns count = {}", log_prefix, liquidate_ixns.len());
 
+        // Add Jito tip instruction if enabled (for MEV protection)
+        if JITO_CLIENT.is_enabled() {
+            let tip_ix = jito::create_tip_instruction(
+                &klend_client.liquidator.wallet.pubkey(),
+                JITO_CLIENT.tip_lamports(),
+            );
+            ixns.push(tip_ix);
+            debug!("{} Added Jito tip instruction ({} lamports)", log_prefix, JITO_CLIENT.tip_lamports());
+        }
+
         // Build transaction with lookup tables
         let swap_luts_count = luts.len();
         let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
@@ -1243,37 +1266,58 @@ async fn liquidate_fast(
         // Skip simulation and submit directly for faster execution
         debug!("{} Skipping simulation for faster execution", log_prefix);
 
-        let should_send = true;
+        // Submit via Jito bundle or regular RPC
+        if JITO_CLIENT.is_enabled() {
+            // Submit via Jito bundle for MEV protection
+            debug!("{} Submitting via Jito bundle (tip: {} lamports)", log_prefix, JITO_CLIENT.tip_lamports());
 
-        if should_send {
-            match klend_client
-                .client
-                .send_retry_and_confirm_transaction(txn, None, false)
-                .await
-            {
-                Ok(sig) => {
-                    info!("{} ✓ Liquidation tx sent: {:?}", log_prefix, sig.0);
-                    debug!("{} Liquidation tx res: {:?}", log_prefix, sig.1);
+            match JITO_CLIENT.send_bundle(vec![txn.clone()]).await {
+                Ok(bundle_id) => {
+                    info!("{} ✓ Jito bundle submitted: {}", log_prefix, bundle_id);
+                    // Note: We don't wait for confirmation here to maximize speed
+                    // The bundle will be included atomically or not at all
                 }
                 Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    // Parse common Kamino error codes for better logging
-                    if err_str.contains("Custom(6016)") {
-                        info!("{} ✗ Lost race: obligation already liquidated (6016)", log_prefix);
-                    } else if err_str.contains("Custom(6009)") {
-                        warn!("{} ✗ Reserve stale - needs refresh (6009)", log_prefix);
-                    } else if err_str.contains("Custom(6023)") {
-                        warn!("{} ✗ Obligation stale - needs refresh (6023)", log_prefix);
-                    } else if err_str.contains("Custom(6015)") {
-                        info!("{} ✗ Liquidation amount too small (6015)", log_prefix);
-                    } else {
-                        warn!("{} ✗ Liquidation tx failed: {:?}", log_prefix, e);
-                    }
+                    warn!("{} ✗ Jito bundle failed: {:?}, falling back to RPC", log_prefix, e);
+                    // Fall back to regular RPC submission
+                    submit_via_rpc(klend_client, txn, log_prefix).await;
                 }
             }
+        } else {
+            // Regular RPC submission
+            submit_via_rpc(klend_client, txn, log_prefix).await;
         }
     }
     Ok(())
+}
+
+/// Submit transaction via regular RPC (non-Jito path)
+async fn submit_via_rpc(klend_client: &KlendClient, txn: VersionedTransaction, log_prefix: &str) {
+    match klend_client
+        .client
+        .send_retry_and_confirm_transaction(txn, None, false)
+        .await
+    {
+        Ok(sig) => {
+            info!("{} ✓ Liquidation tx sent: {:?}", log_prefix, sig.0);
+            debug!("{} Liquidation tx res: {:?}", log_prefix, sig.1);
+        }
+        Err(e) => {
+            let err_str = format!("{:?}", e);
+            // Parse common Kamino error codes for better logging
+            if err_str.contains("Custom(6016)") {
+                info!("{} ✗ Lost race: obligation already liquidated (6016)", log_prefix);
+            } else if err_str.contains("Custom(6009)") {
+                warn!("{} ✗ Reserve stale - needs refresh (6009)", log_prefix);
+            } else if err_str.contains("Custom(6023)") {
+                warn!("{} ✗ Obligation stale - needs refresh (6023)", log_prefix);
+            } else if err_str.contains("Custom(6015)") {
+                info!("{} ✗ Liquidation amount too small (6015)", log_prefix);
+            } else {
+                warn!("{} ✗ Liquidation tx failed: {:?}", log_prefix, e);
+            }
+        }
+    }
 }
 
 async fn crank(klend_client: &KlendClient, obligation_filter: Option<Pubkey>) -> Result<()> {

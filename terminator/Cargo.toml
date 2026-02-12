@@ -67,6 +67,9 @@ itertools = "0.12.0"
 lazy_static = "1.4.0"
 fixed = "=1.27.0"
 
+# Jito bundle support
+rand = "0.8"
+
 # Geyser/LaserStream dependencies
 yellowstone-grpc-client = "1.13.0"
 yellowstone-grpc-proto = "1.12.0"

@@ -579,10 +579,14 @@ async fn test_flash_liquidation(
     info!("\n=== Building Transaction ===");
     let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
 
-    // Add lookup tables
-    if let Some(liquidator_lut) = klend_client.get_lookup_table(&lending_market.key) {
-        info!("Adding liquidator lookup table with {} addresses", liquidator_lut.addresses.len());
-        txn = txn.add_lookup_table(liquidator_lut);
+    // Add lookup tables (market may have multiple LUTs to exceed 256 address limit)
+    let market_luts = klend_client.get_lookup_tables(&lending_market.key);
+    if !market_luts.is_empty() {
+        let total_addresses: usize = market_luts.iter().map(|l| l.addresses.len()).sum();
+        info!("Adding {} liquidator lookup tables with {} total addresses", market_luts.len(), total_addresses);
+        for lut in market_luts {
+            txn = txn.add_lookup_table(lut);
+        }
     }
     for lut in luts {
         txn = txn.add_lookup_table(lut);
@@ -1183,11 +1187,13 @@ async fn liquidate_fast(
         let swap_luts_count = luts.len();
         let mut txn = klend_client.client.tx_builder().add_ixs(ixns.clone());
 
-        // Add liquidator lookup table
+        // Add liquidator lookup tables (market may have multiple LUTs to exceed 256 address limit)
         let mut total_luts = 0;
-        if let Some(liquidator_lut) = klend_client.get_lookup_table(&lending_market.key) {
-            debug!("{} Adding liquidator lookup table with {} addresses", log_prefix, liquidator_lut.addresses.len());
-            txn = txn.add_lookup_table(liquidator_lut);
+        let market_luts = klend_client.get_lookup_tables(&lending_market.key);
+        let market_luts_count = market_luts.len();
+        for lut in market_luts {
+            debug!("{} Adding liquidator lookup table with {} addresses", log_prefix, lut.addresses.len());
+            txn = txn.add_lookup_table(lut);
             total_luts += 1;
         }
 
@@ -1221,7 +1227,7 @@ async fn liquidate_fast(
                 log_prefix,
                 ixns.len(),
                 total_luts,
-                if klend_client.get_lookup_table(&lending_market.key).is_some() { 1 } else { 0 },
+                market_luts_count,
                 swap_luts_count
             );
             return Ok(());

@@ -470,31 +470,58 @@ async fn test_flash_liquidation(
         )
         .await;
 
-        match swap_result {
-            Ok(result) => {
-                let SwapResult { route: _, tx: swap_tx } = result;
-                let DecompiledVersionedTx {
-                    lookup_tables,
-                    instructions: swap_ixs,
-                } = swap_tx;
-
-                // Filter compute budget ixns
-                let swap_ixs: Vec<_> = swap_ixs
-                    .into_iter()
-                    .filter(|ix| ix.program_id != compute_budget::id())
-                    .collect();
-
-                info!("Swap instructions count: {}", swap_ixs.len());
-                ixns.extend_from_slice(&swap_ixs);
-
-                if let Some(lookup_tables) = lookup_tables {
-                    for table in lookup_tables.into_iter() {
-                        luts.push(table);
+        let swap_result = match swap_result {
+            Ok(result) => Some(result),
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("COULD_NOT_FIND_ANY_ROUTE") {
+                    info!("No direct route found, trying multi-hop routing...");
+                    // Use larger accounts_count_buffer for multi-hop to leave room for Kamino liquidation instructions
+                    match get_best_swap_instructions(
+                        &coll_mint,
+                        &debt_mint,
+                        _expected_collateral,
+                        false, // allow multi-hop routes
+                        Some(100),
+                        Some(5.0),
+                        user,
+                        &klend_client.client.client,
+                        None,
+                        Some(35), // Reserve ~35 accounts for Kamino instructions to fit in tx size limit
+                    ).await {
+                        Ok(result) => Some(result),
+                        Err(retry_e) => {
+                            warn!("No swap route found (direct or multi-hop): {:?}, proceeding without swap", retry_e);
+                            None
+                        }
                     }
+                } else {
+                    warn!("No swap route found: {:?}, proceeding without swap", e);
+                    None
                 }
             }
-            Err(e) => {
-                warn!("No swap route found: {:?}, proceeding without swap", e);
+        };
+
+        if let Some(result) = swap_result {
+            let SwapResult { route: _, tx: swap_tx } = result;
+            let DecompiledVersionedTx {
+                lookup_tables,
+                instructions: swap_ixs,
+            } = swap_tx;
+
+            // Filter compute budget ixns
+            let swap_ixs: Vec<_> = swap_ixs
+                .into_iter()
+                .filter(|ix| ix.program_id != compute_budget::id())
+                .collect();
+
+            info!("Swap instructions count: {}", swap_ixs.len());
+            ixns.extend_from_slice(&swap_ixs);
+
+            if let Some(lookup_tables) = lookup_tables {
+                for table in lookup_tables.into_iter() {
+                    luts.push(table);
+                }
             }
         }
     } else if coll_mint != debt_mint {
@@ -1023,13 +1050,45 @@ async fn liquidate_fast(
                             "{} Collateral {} is an LP/kToken (not tradable on DEX), skipping flash loan liquidation",
                             log_prefix, coll_mint
                         );
+                        return Ok(());
+                    }
+
+                    // If direct route failed, retry with multi-hop routing
+                    if err_str.contains("COULD_NOT_FIND_ANY_ROUTE") {
+                        info!("{} No direct route found, trying multi-hop routing...", log_prefix);
+                        let retry_start = std::time::Instant::now();
+                        // Use larger accounts_count_buffer for multi-hop to leave room for Kamino liquidation instructions
+                        match get_best_swap_instructions(
+                            &coll_mint,
+                            &debt_mint,
+                            expected_collateral,
+                            false, // allow multi-hop routes
+                            Some(100), // slippage_bps
+                            Some(5.0), // price_impact_limit
+                            user,
+                            &klend_client.client.client,
+                            None,
+                            Some(35), // Reserve ~35 accounts for Kamino instructions to fit in tx size limit
+                        ).await {
+                            Ok(result) => {
+                                info!("{} Multi-hop route found in {}ms", log_prefix, retry_start.elapsed().as_millis());
+                                result
+                            }
+                            Err(retry_e) => {
+                                warn!(
+                                    "{} No swap route found (direct or multi-hop) from {} to {}: {:?}, skipping liquidation",
+                                    log_prefix, coll_mint, debt_mint, retry_e
+                                );
+                                return Ok(());
+                            }
+                        }
                     } else {
                         warn!(
                             "{} No swap route found from {} to {}: {:?}, skipping liquidation",
                             log_prefix, coll_mint, debt_mint, e
                         );
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             };
 

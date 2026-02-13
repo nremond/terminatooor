@@ -1,0 +1,41 @@
+[Unit]
+Description=Kamino Lending Liquidator (terminatooor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liquidator
+Group=liquidator
+
+# Working directory
+WorkingDirectory=/opt/terminatooor/terminator
+
+# Environment file with secrets and config
+EnvironmentFile=/opt/terminatooor/.env
+
+# Main command
+ExecStart=/opt/terminatooor/terminator/target/release/terminatooor \
+    --keypair /opt/terminatooor/keys/liquidator-keypair.json \
+    crank-stream
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=terminatooor
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/terminatooor
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

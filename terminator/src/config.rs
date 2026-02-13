@@ -91,6 +91,7 @@ pub fn get_rebalance_config_for_action(action: &Actions) -> Option<RebalanceConf
         | Actions::CrankStream { rebalance_args, .. }
         | Actions::TestFlashLiquidation { rebalance_args, .. }
         | Actions::ProfileIxBuilding { rebalance_args, .. } => Some(parse_rebalance_args(rebalance_args)),
+        Actions::TestJito => None,
     }
 }
 

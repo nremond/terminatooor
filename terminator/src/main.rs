@@ -204,6 +204,11 @@ pub enum Actions {
         #[clap(flatten)]
         rebalance_args: RebalanceArgs,
     },
+
+    /// Test Jito bundle submission endpoint
+    /// Sends a minimal test transaction (self-transfer + tip) to validate configuration
+    #[clap()]
+    TestJito,
 }
 
 #[tokio::main]
@@ -260,6 +265,56 @@ async fn main() -> Result<()> {
             iterations,
             rebalance_args: _,
         } => profile_ix_building(&klend_client, &obligation, iterations).await,
+        Actions::TestJito => test_jito_connection(&klend_client).await,
+    }
+}
+
+/// Test Jito bundle submission by sending a minimal transaction
+async fn test_jito_connection(klend_client: &Arc<KlendClient>) -> Result<()> {
+    info!("=== Testing Jito Bundle Submission ===");
+
+    if !JITO_CLIENT.is_enabled() {
+        error!("Jito is not enabled. Set JITO_ENABLED=true");
+        return Err(anyhow::anyhow!("Jito not enabled"));
+    }
+
+    // Get recent blockhash
+    let recent_blockhash = klend_client.client.client.get_latest_blockhash().await?;
+    info!("Recent blockhash: {}", recent_blockhash);
+
+    // Get payer keypair
+    let payer = klend_client.client.payer()
+        .map_err(|_| anyhow::anyhow!("No keypair configured"))?;
+    info!("Payer: {}", payer.pubkey());
+
+    // Check balance
+    let balance = klend_client.client.client.get_balance(&payer.pubkey()).await?;
+    let required = JITO_CLIENT.tip_lamports() + 5000; // tip + rent
+    info!("Balance: {} lamports ({} SOL)", balance, balance as f64 / 1_000_000_000.0);
+    if balance < required {
+        error!("Insufficient balance. Need at least {} lamports for tip + fees", required);
+        return Err(anyhow::anyhow!("Insufficient balance"));
+    }
+
+    // Test the connection
+    match JITO_CLIENT.test_connection(&payer, recent_blockhash).await {
+        Ok(bundle_id) => {
+            info!("=== Jito Test PASSED ===");
+            info!("Bundle ID: {}", bundle_id);
+            info!("Your Jito configuration is working correctly!");
+            Ok(())
+        }
+        Err(e) => {
+            error!("=== Jito Test FAILED ===");
+            error!("Error: {}", e);
+            error!("");
+            error!("Troubleshooting:");
+            error!("  1. Check JITO_ENDPOINT_URL is correct");
+            error!("  2. For Triton: ensure JITO_ENDPOINT_TYPE=triton");
+            error!("  3. For Triton: ensure your IP is whitelisted with Jito Block Engine");
+            error!("  4. Check your Triton subscription includes Jito support");
+            Err(e)
+        }
     }
 }
 

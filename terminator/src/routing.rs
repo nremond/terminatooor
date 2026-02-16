@@ -274,7 +274,7 @@ async fn get_best_swap_instructions_inner(
                 info!("Too many accounts: {} > {}", total_accounts.len(), MAX_ACCOUNTS_PER_TRANSACTION);
             }
             Err(e) => {
-                info!("No route found: {:?}", e);
+                info!("No route found for {} {} -> {}: {:?}", amount, input_mint, output_mint, e);
                 return Err(RoutingError::ApiError(e.to_string()));
             }
         }

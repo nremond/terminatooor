@@ -1327,10 +1327,13 @@ async fn liquidate_fast(
             debug!("{} Submitting via Jito bundle (tip: {} lamports)", log_prefix, JITO_CLIENT.tip_lamports());
 
             match JITO_CLIENT.send_bundle(vec![txn.clone()]).await {
-                Ok(bundle_id) => {
-                    info!("{} ✓ Jito bundle submitted: {}", log_prefix, bundle_id);
-                    // Note: We don't wait for confirmation here to maximize speed
-                    // The bundle will be included atomically or not at all
+                Ok((bundle_id, endpoint)) => {
+                    info!("{} ✓ Jito bundle submitted via {}: {}", log_prefix, endpoint, bundle_id);
+                    // Poll for bundle status to know if it landed or failed
+                    match JITO_CLIENT.get_bundle_status(&bundle_id).await {
+                        Ok(status) => info!("{} Jito bundle status: {:?}", log_prefix, status),
+                        Err(e) => debug!("{} Could not check bundle status: {:?}", log_prefix, e),
+                    }
                 }
                 Err(e) => {
                     warn!("{} ✗ Jito bundle failed: {:?}, falling back to RPC", log_prefix, e);

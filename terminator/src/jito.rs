@@ -284,7 +284,7 @@ impl JitoClient {
     ///
     /// Sends to ALL regional endpoints simultaneously and returns the first successful response.
     /// This maximizes the chance of getting through during high congestion.
-    pub async fn send_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<String> {
+    pub async fn send_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<(String, String)> {
         if !self.config.enabled {
             return Err(anyhow!("Jito is not enabled"));
         }
@@ -306,7 +306,8 @@ impl JitoClient {
 
         // For Triton mode or single endpoint, just send to that one
         if endpoints.len() == 1 {
-            return self.send_bundle_to_endpoint(&encoded_txs, &endpoints[0]).await;
+            let bundle_id = self.send_bundle_to_endpoint(&encoded_txs, &endpoints[0]).await?;
+            return Ok((bundle_id, endpoints[0].clone()));
         }
 
         // For BlockEngine mode, send to ALL endpoints in parallel and race them
@@ -336,7 +337,7 @@ impl JitoClient {
                     self.last_successful_endpoint.store(regional_idx, Ordering::Relaxed);
                 }
                 info!("Jito bundle submitted via {} (first to respond): {}", endpoint, bundle_id);
-                Ok(bundle_id)
+                Ok((bundle_id, endpoint))
             }
             Err(e) => {
                 // All futures failed - return the last error
@@ -410,7 +411,7 @@ impl JitoClient {
         transactions: Vec<VersionedTransaction>,
         timeout: Duration,
     ) -> Result<BundleResult> {
-        let bundle_id = self.send_bundle(transactions).await?;
+        let (bundle_id, _endpoint) = self.send_bundle(transactions).await?;
 
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(500);
@@ -481,7 +482,7 @@ impl JitoClient {
         let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])?;
 
         info!("Submitting test bundle to Jito...");
-        let bundle_id = self.send_bundle(vec![tx]).await?;
+        let (bundle_id, _endpoint) = self.send_bundle(vec![tx]).await?;
         info!("✓ Jito bundle accepted! Bundle ID: {}", bundle_id);
 
         Ok(bundle_id)

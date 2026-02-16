@@ -33,7 +33,7 @@ pub fn get_client_for_action(args: &Args) -> Result<KlendClient> {
     let (payer, placeholder) = get_keypair_for_action(&args.keypair)?;
     let commitment = CommitmentConfig::processed();
     let rpc = RpcClient::new_with_timeout_and_commitment(
-        args.cluster.url().to_string(),
+        args.rpc_url.url().to_string(),
         Duration::from_secs(300),
         commitment,
     );

@@ -42,9 +42,9 @@ pub fn get_client_for_action(args: &Args) -> Result<KlendClient> {
     let rebalance_config = get_rebalance_config_for_action(&args.action);
 
     // Optional dedicated RPC for getProgramAccounts (gPA) calls
-    let gpa_rpc = std::env::var("GPA_RPC_URL").ok().map(|url| {
+    let gpa_rpc = args.gpa_rpc_url.as_ref().map(|url| {
         tracing::info!("Using dedicated gPA RPC: {}", url);
-        RpcClient::new_with_timeout_and_commitment(url, Duration::from_secs(300), commitment)
+        RpcClient::new_with_timeout_and_commitment(url.clone(), Duration::from_secs(300), commitment)
     });
 
     let klend_client = KlendClient::init(

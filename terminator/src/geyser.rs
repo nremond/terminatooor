@@ -140,6 +140,8 @@ pub struct ObligationUpdate {
     pub slot: u64,
     /// The raw account data (can be deserialized to Obligation)
     pub data: Vec<u8>,
+    /// Wall-clock time when this update was received from the Geyser stream
+    pub received_at: std::time::Instant,
 }
 
 /// Geyser stream handle for receiving obligation updates
@@ -407,6 +409,7 @@ async fn process_update(
                     pubkey,
                     slot,
                     data: account.data,
+                    received_at: std::time::Instant::now(),
                 };
 
                 debug!(

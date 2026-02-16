@@ -78,6 +78,10 @@ pub struct Args {
     #[clap(long, env, parse(try_from_str), default_value = "localnet")]
     rpc_url: Cluster,
 
+    /// Dedicated RPC URL for getProgramAccounts calls (faster startup with Helius)
+    #[clap(long, env)]
+    gpa_rpc_url: Option<String>,
+
     /// Account keypair to pay for the transactions
     #[clap(long, env, parse(from_os_str))]
     keypair: Option<PathBuf>,
@@ -839,6 +843,7 @@ async fn liquidate_fast(
     log_prefix: &str,
     oracle_cache: &geyser::OracleCache,
 ) -> Result<()> {
+    let liq_start = std::time::Instant::now();
     info!("{} Liquidating obligation (fast path)", log_prefix);
     let rebalance_config = match &klend_client.rebalance_config {
         None => return Err(anyhow::anyhow!("Rebalance settings not found")),
@@ -889,12 +894,14 @@ async fn liquidate_fast(
         }
     }
     debug!("{} Using {} reserves for market {}", log_prefix, reserves.len(), ob.lending_market);
+    info!("{} Reserves fetched in {}ms", log_prefix, liq_start.elapsed().as_millis());
 
     // Use the maximum slot from all sources plus a buffer to ensure clock is not behind any data.
     // RPC slot can lag behind Geyser or fetched data due to different endpoints/caching.
     // The buffer accounts for this lag and prevents "reserve stale" errors.
     let rpc_slot = klend_client.client.client.get_slot().await.unwrap_or(slot);
     let clock_slot = calculate_clock_slot(rpc_slot, slot);
+    info!("{} RPC slot={} geyser slot={} delta={} (total {}ms)", log_prefix, rpc_slot, slot, rpc_slot as i64 - slot as i64, liq_start.elapsed().as_millis());
     let clock = solana_sdk::clock::Clock {
         slot: clock_slot,
         epoch_start_timestamp: 0,
@@ -1328,12 +1335,7 @@ async fn liquidate_fast(
 
             match JITO_CLIENT.send_bundle(vec![txn.clone()]).await {
                 Ok((bundle_id, endpoint)) => {
-                    info!("{} ✓ Jito bundle submitted via {}: {}", log_prefix, endpoint, bundle_id);
-                    // Poll for bundle status to know if it landed or failed
-                    match JITO_CLIENT.get_bundle_status(&bundle_id).await {
-                        Ok(status) => info!("{} Jito bundle status: {:?}", log_prefix, status),
-                        Err(e) => debug!("{} Could not check bundle status: {:?}", log_prefix, e),
-                    }
+                    info!("{} ✓ Jito bundle submitted via {} in {}ms: {}", log_prefix, endpoint, liq_start.elapsed().as_millis(), bundle_id);
                 }
                 Err(e) => {
                     warn!("{} ✗ Jito bundle failed: {:?}, falling back to RPC", log_prefix, e);
@@ -1679,12 +1681,15 @@ async fn crank_stream(
                             obligation_ltvs.insert(obligation_update.pubkey, ltv_info.ltv);
 
                             if ltv_info.is_liquidatable {
+                                let queue_latency = obligation_update.received_at.elapsed();
                                 info!(
-                                    "{} LIQUIDATABLE: {} LTV={:?} (unhealthy={:?}) latency={}ms",
+                                    "{} LIQUIDATABLE: {} LTV={:?} (unhealthy={:?}) slot={} queue={}ms eval={}ms",
                                     "!!!".red().bold(),
                                     obligation_update.pubkey.to_string().red(),
                                     ltv_info.ltv,
                                     ltv_info.unhealthy_ltv,
+                                    obligation_update.slot,
+                                    queue_latency.as_millis(),
                                     start.elapsed().as_millis()
                                 );
 

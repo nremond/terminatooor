@@ -47,6 +47,9 @@ pub struct KlendClient {
 
     pub client: OrbitLink<RpcClient, Keypair>,
 
+    /// Dedicated RPC client for getProgramAccounts calls (optional, set via GPA_RPC_URL)
+    pub gpa_rpc: Option<RpcClient>,
+
     // Per-market lookup tables for transaction size reduction
     // Key: market pubkey, Value: list of lookup table accounts (multiple LUTs per market to exceed 256 limit)
     pub lookup_tables: RwLock<HashMap<Pubkey, Vec<AddressLookupTableAccount>>>,
@@ -73,6 +76,7 @@ impl KlendClient {
         client: OrbitLink<RpcClient, Keypair>,
         program_id: Pubkey,
         rebalance_config: Option<RebalanceConfig>,
+        gpa_rpc: Option<RpcClient>,
     ) -> Result<Self> {
         // Use the payer keypair from OrbitLink, or create a dummy one for read-only operations
         let wallet = client
@@ -90,6 +94,7 @@ impl KlendClient {
         Ok(Self {
             program_id,
             client,
+            gpa_rpc,
             lookup_tables: RwLock::new(HashMap::new()),
             liquidator,
             rebalance_config,
@@ -112,7 +117,7 @@ impl KlendClient {
 
         // Fetch all reserves
         let reserves: Vec<(Pubkey, Reserve)> =
-            rpc::get_zero_copy_pa(&self.client, &self.program_id, &[]).await?;
+            rpc::get_zero_copy_pa(&self.client, &self.program_id, &[], self.gpa_rpc.as_ref()).await?;
 
         // Sum borrowed amounts per market
         let mut market_borrows: std::collections::HashMap<Pubkey, u128> =
@@ -152,7 +157,7 @@ impl KlendClient {
             MemcmpEncodedBytes::Bytes(market.to_bytes().to_vec()),
         ));
         let filters = vec![filter];
-        let obligations = rpc::get_zero_copy_pa(&self.client, &self.program_id, &filters).await?;
+        let obligations = rpc::get_zero_copy_pa(&self.client, &self.program_id, &filters, self.gpa_rpc.as_ref()).await?;
         Ok(obligations)
     }
 
@@ -166,10 +171,8 @@ impl KlendClient {
     }
 
     pub async fn fetch_referrer_token_states(&self) -> Result<HashMap<Pubkey, ReferrerTokenState>> {
-        let states = self
-            .client
-            .get_all_zero_copy_accounts::<ReferrerTokenState>()
-            .await?;
+        let states: Vec<(Pubkey, ReferrerTokenState)> =
+            rpc::get_zero_copy_pa(&self.client, &self.program_id, &[], self.gpa_rpc.as_ref()).await?;
         let map = states.into_iter().collect();
         Ok(map)
     }
@@ -1224,6 +1227,7 @@ pub mod rpc {
         client: &OrbitLink<RpcClient, Keypair>,
         program_id: &Pubkey,
         filters: &[RpcFilterType],
+        gpa_rpc: Option<&RpcClient>,
     ) -> Result<Vec<(Pubkey, Acc)>>
     where
         Acc: AnyBitPattern + Owner + Discriminator,
@@ -1247,6 +1251,9 @@ pub mod rpc {
             ..RpcProgramAccountsConfig::default()
         };
 
+        // Use dedicated gPA RPC if available, otherwise fall back to main client
+        let rpc_client = gpa_rpc.unwrap_or(&client.client);
+
         // Retry with exponential backoff for rate limiting
         let mut retries = 0;
         let max_retries = 5;
@@ -1259,8 +1266,7 @@ pub mod rpc {
         );
         let start = std::time::Instant::now();
         let accs = loop {
-            match client
-                .client
+            match rpc_client
                 .get_program_accounts_with_config(program_id, config.clone())
                 .await
             {

@@ -72,7 +72,7 @@ pub async fn market_and_reserve_accounts(
     let filters = vec![filter];
 
     let res: Vec<(Pubkey, Reserve)> =
-        rpc::get_zero_copy_pa(&client.client, &client.program_id, &filters).await?;
+        rpc::get_zero_copy_pa(&client.client, &client.program_id, &filters, client.gpa_rpc.as_ref()).await?;
 
     let reserves: HashMap<Pubkey, Reserve> = res.into_iter().collect();
 

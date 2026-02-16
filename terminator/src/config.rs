@@ -40,10 +40,18 @@ pub fn get_client_for_action(args: &Args) -> Result<KlendClient> {
     let orbit_link: OrbitLink<RpcClient, Keypair> =
         OrbitLink::new(rpc, payer, None, commitment, placeholder)?;
     let rebalance_config = get_rebalance_config_for_action(&args.action);
+
+    // Optional dedicated RPC for getProgramAccounts (gPA) calls
+    let gpa_rpc = std::env::var("GPA_RPC_URL").ok().map(|url| {
+        tracing::info!("Using dedicated gPA RPC: {}", url);
+        RpcClient::new_with_timeout_and_commitment(url, Duration::from_secs(300), commitment)
+    });
+
     let klend_client = KlendClient::init(
         orbit_link,
         args.klend_program_id.unwrap_or(kamino_lending::id()),
         rebalance_config,
+        gpa_rpc,
     )?;
     Ok(klend_client)
 }

@@ -47,44 +47,15 @@ echo "Creating directories..."
 sudo mkdir -p /opt/terminatooor/keys
 sudo chown -R $USER:$USER /opt/terminatooor
 
-# Generate GitLab deploy key if not exists
-if [ ! -f ~/.ssh/gitlab_deploy ]; then
-    echo ""
-    echo "Generating GitLab deploy key..."
-    ssh-keygen -t ed25519 -f ~/.ssh/gitlab_deploy -N "" -C "terminatooor-deploy"
 
-    echo ""
-    echo "=========================================="
-    echo "Add this deploy key to GitLab:"
-    echo "GitLab → Repo → Settings → Repository → Deploy Keys"
-    echo "=========================================="
-    cat ~/.ssh/gitlab_deploy.pub
-    echo "=========================================="
-    echo ""
-    read -p "Press Enter after adding the key to GitLab..."
-fi
 
-# Configure SSH to use deploy key for GitLab
-if ! grep -q "gitlab.com" ~/.ssh/config 2>/dev/null; then
-    echo ""
-    echo "Configuring SSH for GitLab..."
-    cat >> ~/.ssh/config << 'EOF'
-
-Host gitlab.com
-    HostName gitlab.com
-    User git
-    IdentityFile ~/.ssh/gitlab_deploy
-    IdentitiesOnly yes
-EOF
-    chmod 600 ~/.ssh/config
-fi
 
 # Clone repository if not exists
 if [ ! -d /opt/terminatooor/.git ]; then
     echo ""
     echo "Cloning repository..."
     # Update this URL to your actual GitLab repo
-    git clone git@gitlab.com:swissborg/terminatooor.git /opt/terminatooor
+    git clone git@github.com:nremond/terminatooor.git /opt/terminatooor
 else
     echo ""
     echo "Repository already cloned"

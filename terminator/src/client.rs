@@ -746,56 +746,52 @@ impl KlendClient {
             }
         }
 
-        // 2. Build Refresh Reserve (for the non-instruction reserves - i.e. deposit, borrow)
+        // 2. Build RefreshReservesBatch (single instruction for all reserves)
         let reserve_fetch_start = std::time::Instant::now();
-        for reserve_acc in unique_reserves {
-            if instruction_reserves.contains(&reserve_acc) {
+        let mut batch_reserves: Vec<(Pubkey, Reserve)> = Vec::new();
+
+        // Collect all unique reserves (non-instruction + instruction), deduped
+        for reserve_acc in &unique_reserves {
+            if instruction_reserves.contains(reserve_acc) {
                 continue;
             }
-            // Use cache if available, otherwise fetch from RPC
             let reserve_opt: Option<Reserve> = if let Some(cache) = reserve_cache {
-                cache.get(&reserve_acc).cloned()
+                cache.get(reserve_acc).cloned()
             } else {
-                self.client.get_anchor_account(&reserve_acc).await.ok()
+                self.client.get_anchor_account(reserve_acc).await.ok()
             };
             let Some(reserve) = reserve_opt else {
                 tracing::warn!("Reserve {} not found in cache or RPC", reserve_acc);
                 continue;
             };
-            let refresh_reserve_ix = instructions::refresh_reserve_ix(
-                &self.program_id,
-                reserve,
-                &reserve_acc,
-                payer.clone(),
-            );
-            println!("Adding pre-ixn refresh_reserve unique {:?}", reserve_acc);
-            pre_instructions.push(refresh_reserve_ix);
+            batch_reserves.push((*reserve_acc, reserve));
         }
-        tracing::debug!("  fetch unique reserves: {}ms", reserve_fetch_start.elapsed().as_millis());
-
-        // 3. Build Refresh Reserve (for the current instruction - i.e. deposit, borrow)
-        let ix_reserve_start = std::time::Instant::now();
-        for reserve_acc in instruction_reserves.clone() {
-            // Use cache if available, otherwise fetch from RPC
+        for reserve_acc in &instruction_reserves {
             let reserve_opt: Option<Reserve> = if let Some(cache) = reserve_cache {
-                cache.get(&reserve_acc).cloned()
+                cache.get(reserve_acc).cloned()
             } else {
-                self.client.get_anchor_account(&reserve_acc).await.ok()
+                self.client.get_anchor_account(reserve_acc).await.ok()
             };
             let Some(reserve) = reserve_opt else {
                 tracing::warn!("Instruction reserve {} not found in cache or RPC", reserve_acc);
                 continue;
             };
-            let refresh_reserve_ix = instructions::refresh_reserve_ix(
+            batch_reserves.push((*reserve_acc, reserve));
+        }
+
+        if !batch_reserves.is_empty() {
+            println!(
+                "Adding pre-ixn refresh_reserves_batch with {} reserves",
+                batch_reserves.len()
+            );
+            let refresh_batch_ix = instructions::refresh_reserves_batch_ix(
                 &self.program_id,
-                reserve,
-                &reserve_acc,
+                &batch_reserves,
                 payer.clone(),
             );
-            println!("Adding pre-ixn refresh_reserve current {:?}", reserve_acc);
-            pre_instructions.push(refresh_reserve_ix);
+            pre_instructions.push(refresh_batch_ix);
         }
-        tracing::debug!("  fetch instruction reserves: {}ms", ix_reserve_start.elapsed().as_millis());
+        tracing::debug!("  collect reserves for batch: {}ms", reserve_fetch_start.elapsed().as_millis());
 
         // 4. Build Refresh Obligation
         let refresh_obligation_ix = instructions::refresh_obligation_ix(

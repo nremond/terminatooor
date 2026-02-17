@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use anchor_client::solana_sdk::{instruction::Instruction, pubkey::Pubkey, signature::Keypair};
+use anchor_client::solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::Keypair,
+};
 use anchor_lang::{prelude::Rent, system_program::System, Id, InstructionData, ToAccountMetas};
 use kamino_lending::{LendingMarket, Reserve, ReserveFarmKind};
 use solana_sdk::{
@@ -135,6 +139,78 @@ pub fn refresh_reserve_ix(
         instruction,
         payer: payer.pubkey(),
         signers: vec![payer.clone()],
+    }
+}
+
+/// Build a single RefreshReservesBatch instruction that refreshes multiple reserves
+/// at once, replacing N individual refresh_reserve instructions with 1.
+///
+/// The on-chain handler iterates remaining_accounts consuming per reserve:
+///   reserve (W), lending_market (R), pyth (R), switchboard_price (R), switchboard_twap (R), scope (R)
+/// Null oracles are represented by the klend program ID.
+pub fn refresh_reserves_batch_ix(
+    program_id: &Pubkey,
+    reserves: &[(Pubkey, Reserve)],
+    payer: Arc<Keypair>,
+) -> InstructionBlocks {
+    let mut accounts: Vec<AccountMeta> = Vec::with_capacity(reserves.len() * 6);
+
+    for (address, reserve) in reserves {
+        // 1. Reserve account (writable)
+        accounts.push(AccountMeta::new(*address, false));
+        // 2. Lending market (read-only)
+        accounts.push(AccountMeta::new_readonly(reserve.lending_market, false));
+        // 3-6. Oracle accounts (read-only), using program_id as null placeholder
+        accounts.push(AccountMeta::new_readonly(
+            oracle_or_program_id(reserve.config.token_info.pyth_configuration.price, program_id),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(
+            oracle_or_program_id(
+                reserve.config.token_info.switchboard_configuration.price_aggregator,
+                program_id,
+            ),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(
+            oracle_or_program_id(
+                reserve.config.token_info.switchboard_configuration.twap_aggregator,
+                program_id,
+            ),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(
+            oracle_or_program_id(
+                reserve.config.token_info.scope_configuration.price_feed,
+                program_id,
+            ),
+            false,
+        ));
+    }
+
+    let instruction = Instruction {
+        program_id: *program_id,
+        accounts,
+        data: kamino_lending::instruction::RefreshReservesBatch {
+            skip_price_updates: false,
+        }
+        .data(),
+    };
+
+    InstructionBlocks {
+        instruction,
+        payer: payer.pubkey(),
+        signers: vec![payer.clone()],
+    }
+}
+
+/// Return oracle pubkey if valid, or the program_id as a null placeholder.
+/// The on-chain handler treats program_id as "no oracle".
+fn oracle_or_program_id(oracle: Pubkey, program_id: &Pubkey) -> Pubkey {
+    if oracle == Pubkey::default() || oracle == NULL_PUBKEY {
+        *program_id
+    } else {
+        oracle
     }
 }
 

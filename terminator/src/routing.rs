@@ -3,18 +3,74 @@
 //! This module provides swap functionality via Triton's Metis API,
 //! which returns address lookup tables for transaction compression.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 use anchor_lang::prelude::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount};
 use solana_sdk::instruction::Instruction;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::consts::{
     EXTRA_ACCOUNTS_BUFFER, MAX_ACCOUNTS_PER_TRANSACTION, MAX_EXTRA_ACCOUNTS_BUFFER,
 };
 use crate::metis;
+
+/// Known Jupiter/Metis ALTs to prewarm at startup.
+/// Add addresses here as they appear in logs ("Loaded swap lookup table X").
+const KNOWN_SWAP_ALTS: &[&str] = &[
+    "3bDh8FpfSZezpiwfKZZJXFKHyoCBqu4LfQaf8Xo3kvJX",
+];
+
+/// Cache for swap Address Lookup Tables to avoid repeated RPC fetches.
+/// Jupiter/Metis ALTs are long-lived and rarely change within a session.
+pub struct SwapAltCache {
+    inner: RwLock<HashMap<Pubkey, AddressLookupTableAccount>>,
+}
+
+impl SwapAltCache {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Prewarm the cache by fetching known ALTs from RPC at startup.
+    pub async fn prewarm(&self, rpc_client: &RpcClient) {
+        let addresses: Vec<Pubkey> = KNOWN_SWAP_ALTS
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        if addresses.is_empty() {
+            return;
+        }
+
+        info!("Prewarming swap ALT cache with {} known addresses", addresses.len());
+        let mut loaded = 0;
+        for address in &addresses {
+            match rpc_client.get_account(address).await {
+                Ok(account) => {
+                    match AddressLookupTable::deserialize(&account.data) {
+                        Ok(table) => {
+                            let alt = AddressLookupTableAccount {
+                                key: *address,
+                                addresses: table.addresses.to_vec(),
+                            };
+                            info!("Prewarmed swap ALT {} ({} addresses)", address, alt.addresses.len());
+                            self.inner.write().unwrap().insert(*address, alt);
+                            loaded += 1;
+                        }
+                        Err(e) => warn!("Failed to deserialize swap ALT {}: {:?}", address, e),
+                    }
+                }
+                Err(e) => warn!("Failed to fetch swap ALT {}: {:?}", address, e),
+            }
+        }
+        info!("Swap ALT cache prewarmed: {}/{} loaded", loaded, addresses.len());
+    }
+}
 
 /// Error type for routing operations
 #[derive(Debug)]
@@ -76,6 +132,7 @@ pub async fn get_best_swap_instructions(
     rpc_client: &RpcClient,
     accounts: Option<&Vec<&Pubkey>>,
     accounts_count_buffer: Option<usize>,
+    swap_alt_cache: &SwapAltCache,
 ) -> RoutingResult<SwapResult> {
     // Try with the requested route type first
     let result = get_best_swap_instructions_inner(
@@ -89,6 +146,7 @@ pub async fn get_best_swap_instructions(
         rpc_client,
         accounts,
         accounts_count_buffer,
+        swap_alt_cache,
     )
     .await;
 
@@ -109,6 +167,7 @@ pub async fn get_best_swap_instructions(
                     rpc_client,
                     accounts,
                     accounts_count_buffer,
+                    swap_alt_cache,
                 )
                 .await;
 
@@ -141,6 +200,7 @@ async fn get_best_swap_instructions_inner(
     rpc_client: &RpcClient,
     accounts: Option<&Vec<&Pubkey>>,
     accounts_count_buffer: Option<usize>,
+    swap_alt_cache: &SwapAltCache,
 ) -> RoutingResult<SwapResult> {
     let accounts_count_buffer = accounts_count_buffer.unwrap_or(0);
     let mut extra_accounts_buffer = EXTRA_ACCOUNTS_BUFFER;
@@ -246,11 +306,9 @@ async fn get_best_swap_instructions_inner(
 
                     info!("Metis returned {} lookup table addresses", alt_addresses.len());
 
-                    // Fetch lookup tables from RPC
+                    // Fetch lookup tables (from cache or RPC)
                     let lookup_tables = if !alt_addresses.is_empty() {
-                        info!("Fetching swap lookup tables: {:?}", alt_addresses);
-                        let tables = fetch_lookup_tables(rpc_client, &alt_addresses).await;
-                        info!("Fetched {} swap lookup tables", tables.len());
+                        let tables = fetch_lookup_tables(rpc_client, &alt_addresses, swap_alt_cache).await;
                         if tables.is_empty() { None } else { Some(tables) }
                     } else {
                         None
@@ -285,22 +343,46 @@ async fn get_best_swap_instructions_inner(
     Err(RoutingError::NoValidRoute)
 }
 
-/// Fetch lookup table accounts from RPC given their addresses
+/// Fetch lookup table accounts, serving from cache when possible.
 async fn fetch_lookup_tables(
     rpc_client: &RpcClient,
     addresses: &[Pubkey],
+    cache: &SwapAltCache,
 ) -> Vec<AddressLookupTableAccount> {
     let mut tables = Vec::new();
-    for address in addresses {
+    let mut missing = Vec::new();
+
+    // Check cache first
+    {
+        let cache_read = cache.inner.read().unwrap();
+        for address in addresses {
+            if let Some(table) = cache_read.get(address) {
+                debug!("Swap ALT cache hit: {} ({} addresses)", address, table.addresses.len());
+                tables.push(table.clone());
+            } else {
+                missing.push(*address);
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        return tables;
+    }
+
+    // Fetch missing from RPC
+    info!("Fetching {} swap lookup tables from RPC: {:?}", missing.len(), missing);
+    for address in &missing {
         match rpc_client.get_account(address).await {
             Ok(account) => {
                 match AddressLookupTable::deserialize(&account.data) {
                     Ok(table) => {
-                        tables.push(AddressLookupTableAccount {
+                        let alt = AddressLookupTableAccount {
                             key: *address,
                             addresses: table.addresses.to_vec(),
-                        });
-                        info!("Loaded swap lookup table {} with {} addresses", address, table.addresses.len());
+                        };
+                        info!("Loaded swap lookup table {} with {} addresses", address, alt.addresses.len());
+                        cache.inner.write().unwrap().insert(*address, alt.clone());
+                        tables.push(alt);
                     }
                     Err(e) => {
                         warn!("Failed to deserialize lookup table {}: {:?}", address, e);

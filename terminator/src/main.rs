@@ -25,7 +25,7 @@ use crate::{
     config::get_lending_markets,
     geyser::{GeyserConfig, GeyserStream},
     jito::{JitoClient, JitoConfig},
-    routing::{get_best_swap_instructions, SwapResult},
+    routing::{get_best_swap_instructions, SwapAltCache, SwapResult},
     liquidator::Holdings,
     math::{LiquidationStrategy, Fraction},
     model::StateWithKey,
@@ -535,6 +535,7 @@ async fn test_flash_liquidation(
     // 3. Swap instructions (if collateral != debt)
     // Skip swap for this test if METIS_ENDPOINT is not configured
     let _expected_collateral = liquidate_amount; // Simplified estimate
+    let swap_alt_cache = SwapAltCache::new();
     if coll_mint != debt_mint && std::env::var("METIS_ENDPOINT").is_ok() {
         info!("Getting swap instructions: {} -> {}", coll_mint, debt_mint);
         let user = klend_client.liquidator.wallet.pubkey();
@@ -549,6 +550,7 @@ async fn test_flash_liquidation(
             &klend_client.client.client,
             None,
             None,
+            &swap_alt_cache,
         )
         .await;
 
@@ -570,6 +572,7 @@ async fn test_flash_liquidation(
                         &klend_client.client.client,
                         None,
                         Some(35), // Reserve ~35 accounts for Kamino instructions to fit in tx size limit
+                        &swap_alt_cache,
                     ).await {
                         Ok(result) => Some(result),
                         Err(retry_e) => {
@@ -853,6 +856,7 @@ async fn liquidate_fast(
     log_prefix: &str,
     oracle_cache: &geyser::OracleCache,
     reserve_cache: &geyser::ReserveCache,
+    swap_alt_cache: &SwapAltCache,
 ) -> Result<()> {
     let liq_start = std::time::Instant::now();
     info!("{} Liquidating obligation (fast path)", log_prefix);
@@ -1124,6 +1128,7 @@ async fn liquidate_fast(
                     &klend_client.client.client,
                     None,
                     None,
+                    swap_alt_cache,
                 ).await;
                 debug!("{} Swap quote fetched in {}ms", log_prefix_owned2, start.elapsed().as_millis());
                 Some(result)
@@ -1170,6 +1175,7 @@ async fn liquidate_fast(
                             &klend_client.client.client,
                             None,
                             Some(35), // Reserve ~35 accounts for Kamino instructions to fit in tx size limit
+                            swap_alt_cache,
                         ).await {
                             Ok(result) => {
                                 info!("{} Multi-hop route found in {}ms", log_prefix, retry_start.elapsed().as_millis());
@@ -1646,6 +1652,10 @@ async fn crank_stream(
     let orchestrator = Arc::new(parallel::LiquidationOrchestrator::new(parallel_config.clone()));
     info!("Parallel liquidation orchestrator initialized (max_concurrent={})", parallel_config.max_concurrent);
 
+    // Cache for swap Address Lookup Tables (avoids repeated RPC fetches for known Jupiter ALTs)
+    let swap_alt_cache = SwapAltCache::new();
+    swap_alt_cache.prewarm(&klend_client.client.client).await;
+
     // Track obligations we've seen and their LTVs
     let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
     let mut last_state_refresh = std::time::Instant::now();
@@ -1762,6 +1772,7 @@ async fn crank_stream(
                                             &prefix,
                                             geyser_stream.oracle_cache(),
                                             geyser_stream.reserve_cache(),
+                                            &swap_alt_cache,
                                         )).catch_unwind().await;
 
                                         match liquidation_result {

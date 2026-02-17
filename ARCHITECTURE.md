@@ -4,231 +4,40 @@ A flash loan liquidator bot for the Kamino Lending protocol on Solana.
 
 ## Overview
 
-This bot monitors unhealthy lending positions (obligations) on Kamino and liquidates them for profit. It uses **flash loans** to execute liquidations without requiring upfront capital - only SOL for transaction fees.
+The bot monitors unhealthy lending positions (obligations) on Kamino via Geyser streaming and liquidates them using flash loans — no upfront capital required, only SOL for transaction fees. Liquidations are submitted as Jito bundles for MEV protection.
 
 ## Key Concepts
 
-### Obligations
-An **obligation** is a user's lending position on Kamino. It contains:
-- **Deposits**: Collateral the user has deposited (stored as cTokens)
-- **Borrows**: Tokens the user has borrowed
-
-Each obligation has a **Loan-to-Value (LTV)** ratio. When LTV exceeds the `unhealthy_ltv` threshold, the position becomes liquidatable.
-
-### Reserves
-A **reserve** represents a single asset market (e.g., SOL, USDC). Each reserve tracks:
-- Total liquidity available for borrowing
-- Total borrowed amount
-- Interest rates and fees
-- Oracle price configurations
-- Flash loan fee
-
-### cTokens (Collateral Tokens)
-When users deposit assets into Kamino, they receive **cTokens** in return. These are interest-bearing tokens that represent a share of the reserve's liquidity pool.
-
-- Depositing 100 SOL might give you 95 kSOL (cTokens)
-- As interest accrues, the exchange rate increases
-- Later, those 95 kSOL might be redeemable for 105 SOL
-
-**Exchange Rate Formula:**
-```
-exchange_rate = total_liquidity / ctoken_supply
-
-where:
-  total_liquidity = available_amount + borrowed_amount
-  ctoken_supply = mint_total_supply of the cToken
-```
+- **Obligation**: A user's lending position containing deposits (collateral) and borrows. When the Loan-to-Value ratio exceeds the `unhealthy_ltv` threshold, it becomes liquidatable.
+- **Reserve**: A single asset market (e.g., SOL, USDC) tracking liquidity, borrows, interest rates, oracle configs, and flash loan fees.
+- **cTokens**: Interest-bearing tokens representing a share of a reserve's liquidity pool. The `liquidate_obligation_and_redeem_reserve_collateral` instruction atomically liquidates and redeems cTokens, so the liquidator receives the underlying token directly.
 
 ## Flash Loan Liquidation Flow
 
-The bot executes liquidations atomically using flash loans:
-
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Single Atomic Transaction                         │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  1. Flash Borrow                                                     │
-│     └─> Borrow debt token (e.g., USDC) from Kamino reserve          │
-│                                                                      │
-│  2. Refresh Reserves & Obligation                                    │
-│     └─> Update all reserve prices and obligation state              │
-│                                                                      │
-│  3. Liquidate & Redeem                                               │
-│     └─> Repay user's debt with borrowed tokens                      │
-│     └─> Receive collateral (automatically redeemed from cTokens)    │
-│     └─> e.g., Pay 100 USDC debt, receive 105 USDC worth of SOL      │
-│                                                                      │
-│  4. Swap Collateral                                                  │
-│     └─> Swap received collateral back to debt token                 │
-│     └─> e.g., Swap SOL → USDC via Titan aggregator                  │
-│                                                                      │
-│  5. Flash Repay                                                      │
-│     └─> Repay flash loan + fee                                      │
-│     └─> Keep remaining tokens as profit                             │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                  Single Atomic Transaction                  │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  1. Flash Borrow                                           │
+│     └─> Borrow debt token from Kamino reserve              │
+│                                                            │
+│  2. Refresh Reserves & Obligation                          │
+│     └─> Update all reserve prices and obligation state     │
+│                                                            │
+│  3. Liquidate & Redeem                                     │
+│     └─> Repay debt, receive collateral (auto-redeemed)     │
+│                                                            │
+│  4. Swap Collateral                                        │
+│     └─> Swap collateral back to debt token via Metis       │
+│                                                            │
+│  5. Flash Repay                                            │
+│     └─> Repay flash loan + fee, keep profit                │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### Why cTokens Don't Appear in Swaps
-
-The Kamino instruction `liquidate_obligation_and_redeem_reserve_collateral` does two things atomically:
-1. **Liquidates** the position (repay debt, seize collateral cTokens)
-2. **Redeems** the cTokens for underlying tokens
-
-So the liquidator receives the actual underlying token (SOL, not kSOL), which can be directly swapped on DEX aggregators.
-
-### Profit Calculation
-
-```
-profit = collateral_received - flash_loan_repay - swap_slippage
-
-where:
-  collateral_received = liquidate_amount × (1 + liquidation_bonus)
-  flash_loan_repay = liquidate_amount × (1 + flash_loan_fee)
-  swap_slippage = collateral_received × slippage_bps / 10000
-```
-
-Typical values:
-- Liquidation bonus: 5% (you get 5% more collateral than debt repaid)
-- Flash loan fee: 0.09% (minimal cost)
-- Swap slippage: 0.5-1%
-
-## Architecture Components
-
-### 1. Geyser Streaming (`geyser.rs`)
-Real-time account monitoring via Helius LaserStream (Yellowstone gRPC):
-- Subscribes to all Kamino obligation accounts (by program owner)
-- Subscribes to oracle accounts (Pyth, Switchboard, Scope) by specific pubkey
-- Subscribes to reserve accounts by specific pubkey for real-time reserve data
-- Receives instant updates when positions become unhealthy
-- Much faster than polling RPC endpoints
-- **OracleCache**: Thread-safe `Arc<RwLock<HashMap>>` updated on each Geyser oracle update, with slot-based staleness protection
-- **ReserveCache**: Thread-safe `Arc<RwLock<HashMap>>` storing deserialized `Reserve` structs, updated on each Geyser reserve update. Deserialization happens on the write path (off the critical liquidation path) so reads are instant
-- **Initialization order**: Geyser connection is deferred until AFTER market state loading to prevent channel overflow during startup. Caches are seeded from loaded market state before streaming begins
-- **Auto-reconnect**: Automatic reconnection with exponential backoff (500ms → 60s max)
-- **Stale connection detection**: If no messages received for 2 minutes, connection is considered stale and reconnects
-- **Connection timeout**: 30 second timeout for initial connection
-
-### 2. Obligation Scanner (`scanner.rs`)
-Evaluates obligation health:
-- Calculates current LTV from refreshed reserve prices
-- Identifies liquidatable positions (LTV > unhealthy_ltv)
-- Determines optimal liquidation amount
-
-### 3. Price Oracle (`px.rs`)
-Fetches token prices from multiple sources:
-- Pyth Network
-- Switchboard
-- Scope (Kamino's price aggregator)
-
-### 4. Swap Router (`routing.rs`, `metis.rs`)
-Gets optimal swap routes via Metis/Jupiter aggregator:
-- Connects via WebSocket for streaming quotes
-- Supports all major Solana DEXes
-- Returns transaction instructions for the best route
-- **Early exit on empty quotes**: If Titan returns 3 consecutive empty quote responses (no liquidity for the pair), exits early instead of waiting for the 30-second timeout
-- **Single quote call**: Uses `get_quote_with_instructions` to get route AND instructions in one call, ensuring ALTs match the actual swap instructions
-- **Non-direct route fallback**: When direct routes have no ALTs (causing large transactions), automatically tries non-direct routes which may use DEXes that provide lookup tables
-
-### 5. Liquidator (`liquidator.rs`)
-Manages the liquidator wallet:
-- Creates Associated Token Accounts (ATAs) for all tokens
-- Handles both SPL Token and Token-2022 programs
-- Tracks token holdings and balances
-
-### 6. Transaction Builder (`client.rs`, `instructions.rs`)
-Constructs and sends liquidation transactions:
-- Builds flash loan borrow/repay instructions
-- Adds compute budget for complex transactions
-- Handles transaction confirmation and retries
-
-### 7. Address Lookup Tables (`lookup_tables.rs`)
-Per-market lookup tables to reduce transaction size:
-- Each lending market has its own Address Lookup Table (ALT)
-- ALTs are created/extended **only at startup**, stored in `liquidator_lookup_tables.json`
-- Contains keys for that market only: reserve pubkeys, liquidator ATAs for market tokens, market authorities
-- Reduces transaction size by replacing 32-byte addresses with 1-byte indices
-- **Cached in memory** after initial load - no RPC calls during liquidation
-- Periodic refresh skips ALT extension to avoid blocking the hot path
-
-**256 Address Limit**: Solana ALTs have a hard limit of 256 addresses. For markets with many reserves, the bot prioritizes reserves by borrow volume (most active first). If a market has more than ~22 reserves, low-volume reserves won't fit in the LUT, and liquidations involving those reserves may fail due to transaction size. See warning log: `Lookup table for market X is full (256 addresses)`
-
-### 8. Liquidation Orchestrator (`parallel.rs`)
-Manages liquidation attempts with deduplication and cooldown:
-- **Deduplication**: Prevents attempting same obligation twice simultaneously
-- **Cooldown tracking**: Enforces wait period between attempts on same obligation
-- **Rate limiting**: Semaphore-based concurrency control
-- **Structured logging**: Unique task IDs for filtering logs (`[T42:8xBnR5kd]`)
-- **Error classification**: Categorizes errors as Permanent/Retryable/Unknown
-- **Pure functions**: Core logic testable without I/O
-
-## Reserve Refresh Requirements
-
-Before liquidating, ALL reserves referenced by an obligation must be refreshed in the same slot:
-
-```rust
-// An obligation with SOL collateral and USDC + BONK borrows
-// requires refreshing ALL THREE reserves:
-refresh_reserve(SOL_RESERVE);   // collateral
-refresh_reserve(USDC_RESERVE);  // borrow 1
-refresh_reserve(BONK_RESERVE);  // borrow 2
-refresh_obligation(...);
-liquidate(...);
-```
-
-This ensures prices are synchronized and the protocol can accurately calculate the obligation's health.
-
-## Transaction Size Constraints
-
-Solana transactions have a hard limit of **1232 bytes** (serialized). Flash loan liquidations are complex transactions that can exceed this limit.
-
-### Size Reduction Strategies
-
-1. **Address Lookup Tables (ALTs)**: Replace 32-byte addresses with 1-byte indices
-2. **Direct swap routes**: Use `only_direct_routes=true` to avoid multi-hop swaps that add accounts
-3. **Per-market ALTs**: Each market has its own ALT with ~170 addresses
-4. **Swap ALTs**: Titan returns ALTs for swap instructions, fetched and included in transaction
-
-### Known Limitations
-
-| Collaterals | Fits in TX? | Notes |
-|-------------|-------------|-------|
-| 1-2 | ✅ Yes | ~10-15% headroom |
-| 3-4 | ✅ Yes | ~5% headroom |
-| 5+ | ❌ No | Exceeds 1232 bytes even with all optimizations |
-
-Positions with 5+ collateral types cannot be liquidated in a single transaction. Future options:
-- Jito bundles (but flash loans require borrow+repay in same TX)
-- Multiple partial liquidations
-- Custom on-chain helper program
-
-### Lookup Table Overflow
-
-Markets with many reserves (>22) exceed the 256-address ALT limit:
-
-| Symptom | Cause | Impact |
-|---------|-------|--------|
-| `Lookup table is full (256 addresses). X keys not in LUT` | Market has more reserves than ALT can hold | Liquidations involving low-volume reserves may exceed tx size |
-
-**Current behavior**: Reserves are prioritized by borrow volume. High-volume reserves are always in the LUT. Low-volume reserves may be excluded.
-
-**Future options**:
-- Multiple LUTs per market (overflow tables)
-- Per-liquidation check to skip positions involving excluded reserves
-- On-demand LUT creation for specific liquidations
-
-## Token-2022 Support
-
-Some Solana tokens use the new Token-2022 program instead of the original SPL Token program. The bot handles this by:
-
-1. **Detecting token program**: Check the mint account's owner
-2. **Creating correct ATAs**: Use `get_associated_token_address_with_program_id`
-3. **Parsing accounts**: Token-2022 accounts may have extensions (>165 bytes) but the base account structure is compatible
-
-## Transaction Structure
-
-A typical flash loan liquidation transaction:
+### Transaction Structure
 
 ```
 Index  Instruction
@@ -244,40 +53,93 @@ Index  Instruction
 N+1    flash_repay_reserve_liquidity(borrow_index=2)
 ```
 
-The `flash_repay` instruction references the `flash_borrow` by its index, allowing the protocol to verify the loan is repaid in the same transaction.
+The `flash_repay` instruction references the `flash_borrow` by its index, allowing the protocol to verify the loan is repaid in the same transaction. All reserves referenced by the obligation must be refreshed in the same slot to ensure synchronized prices.
+
+## Architecture Components
+
+### 1. Geyser Streaming (`geyser.rs`)
+
+Real-time account monitoring via Helius LaserStream (Yellowstone gRPC):
+- Subscribes to obligation accounts (by program owner), oracle accounts, and reserve accounts (by pubkey)
+- **OracleCache**: `Arc<RwLock<HashMap>>` with slot-based staleness protection, updated on each Geyser oracle update
+- **ReserveCache**: `Arc<RwLock<HashMap>>` storing deserialized `Reserve` structs. Deserialization happens on the write path (off the critical liquidation path) so reads are instant
+- Caches are seeded from loaded market state before streaming begins
+- Auto-reconnect with exponential backoff (500ms to 60s max), stale connection detection (2min timeout)
+
+### 2. Obligation Scanner (`scanner.rs`)
+
+Evaluates obligation health from Geyser updates. Calculates current LTV, identifies liquidatable positions, and determines optimal liquidation amount.
+
+### 3. Swap Router (`routing.rs`, `metis.rs`)
+
+Gets optimal swap routes via Metis/Jupiter HTTP API:
+- Single `get_quote_with_instructions` call for route + instructions + ALTs in one request
+- Uses `only_direct_routes=true` to minimize accounts; falls back to non-direct routes when direct routes lack ALTs
+
+### 4. Address Lookup Tables (`lookup_tables.rs`)
+
+Per-market ALTs created/extended at startup only, cached in memory:
+- Each market has its own ALT (~170 addresses): reserve pubkeys, liquidator ATAs, market authorities
+- Reduces transaction size by replacing 32-byte addresses with 1-byte indices
+- 256-address hard limit per ALT; reserves prioritized by borrow volume
+
+### 5. Liquidation Orchestrator (`parallel.rs`)
+
+```
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│  Geyser Stream  │────>│  LiquidationOrch.    │────>│  liquidate_fast │
+│  (obligations)  │     │  (dedup + cooldown)  │     │  (sequential)   │
+└─────────────────┘     └──────────────────────┘     └─────────────────┘
+```
+
+- Deduplication and cooldown tracking via `InFlightTracker`
+- Semaphore-based concurrency control
+- Error classification: Permanent (don't retry), Retryable (retry after cooldown), Unknown
+
+Liquidations execute sequentially on the main thread because the Kamino lending library uses `Rc<RefCell<>>` internally (`!Send`). The orchestrator still prevents duplicate attempts on the same obligation.
+
+### 6. Jito Submission
+
+Transactions are wrapped in Jito bundles (tip + liquidation tx) and submitted to 4 EU endpoints in parallel via `select_ok` — first successful response wins.
+
+## Transaction Size Constraints
+
+Solana transactions have a **1232-byte** serialized limit. Size reduction strategies:
+- Address Lookup Tables (per-market + swap ALTs from Metis)
+- Direct swap routes to minimize accounts
+
+| Collaterals | Fits in TX? | Notes |
+|-------------|-------------|-------|
+| 1-4 | Yes | 5-15% headroom |
+| 5+ | No | Exceeds 1232 bytes even with all optimizations |
 
 ## Hot Path Optimizations
 
-Speed is critical for liquidations - positions can become healthy again within seconds. The bot uses several optimizations to minimize latency on the critical path from Geyser update to Jito submission.
+Speed is critical — positions can become healthy again within seconds. The bot minimizes latency on the critical path from Geyser update to Jito submission.
 
 ### Cached Data
 
-At startup and during periodic refresh, the bot seeds several caches:
-- **MarketState**: Reserves, referrer token states, oracle data for each market
-- **OracleCache**: Real-time oracle prices streamed via Geyser (no RPC needed)
-- **ReserveCache**: Real-time reserve data streamed via Geyser (no RPC needed)
-- **BlockhashCache**: Background task refreshes blockhash every 2s via `tokio::sync::watch` channel
-- **Lookup tables**: Address lookup tables loaded once at startup, then cached in memory
+- **MarketState**: Reserves, referrer token states, oracle data (refreshed every ~4 hours)
+- **OracleCache**: Real-time oracle prices streamed via Geyser
+- **ReserveCache**: Real-time reserve data streamed via Geyser
+- **BlockhashCache**: Background task refreshes every 2s via `tokio::sync::watch` channel
+- **Lookup tables**: Loaded once at startup, cached in memory
 
 ### Fast Liquidation Path (`liquidate_fast`)
 
-When a liquidatable position is detected via Geyser, the bot uses cached/streamed data instead of making RPC calls:
-
-| Data | Before | After |
-|------|--------|-------|
-| Obligation | RPC fetch (~140ms) | From Geyser update (0ms) |
-| Reserves | RPC batch fetch (~75ms) | From Geyser ReserveCache (0ms) |
-| Oracle prices | RPC fetch (~100ms) | From Geyser OracleCache (0ms) |
-| Referrer states | RPC fetch (~50ms) | From MarketState cache (0ms) |
-| Clock/slot | RPC getSlot (~40ms) | From Geyser slot + buffer (0ms) |
-| Blockhash | RPC fetch per tx (~50ms) | Background cache (0ms) |
-| Lookup tables | RPC fetch × N (~1100ms) | Memory cache (0ms) |
-| Farm user states | Sequential RPC (~60ms) | Parallel with swap quote (0ms extra) |
-| Swap quotes | HTTP to Metis (~200ms) | HTTP to Metis (~200ms, unavoidable) |
+| Data | Source | Latency |
+|------|--------|---------|
+| Obligation | Geyser update | 0ms |
+| Reserves | Geyser ReserveCache | 0ms |
+| Oracle prices | Geyser OracleCache | 0ms |
+| Referrer states | MarketState cache | 0ms |
+| Clock/slot | Geyser slot + buffer | 0ms |
+| Blockhash | Background cache | 0ms |
+| Lookup tables | Memory cache | 0ms |
+| Farm user states | RPC (parallel with swap) | 0ms extra |
+| Swap quotes | Metis HTTP API | ~200ms |
 
 ### Parallel Execution
-
-The critical path uses `tokio::join!` to overlap independent operations:
 
 ```
 Reserve cache read (0ms) ──┐
@@ -291,289 +153,19 @@ Metis swap quote (200ms) ──┘
 Build tx (cached blockhash, 0ms) ──> Jito submit (4 endpoints race, 80ms)
 ```
 
-### RPC Calls Per Liquidation (Typical)
+### RPC Calls Per Liquidation
 
-With all caches warm (the common case after startup):
+With all caches warm (common case):
 
-| Call | When | Latency |
-|------|------|---------|
-| `get_multiple_accounts` (farm states) | Always (inside parallel section) | ~60ms (hidden under swap) |
-| Metis API `/quote` + `/swap-instructions` | When collateral != debt | ~200ms |
-| Jito `send_bundle` × 4 endpoints | Always (parallel, first wins) | ~80ms |
+| Call | Latency |
+|------|---------|
+| `get_multiple_accounts` (farm states) | ~60ms (hidden under swap) |
+| Metis API `/quote` + `/swap-instructions` | ~200ms |
+| Jito `send_bundle` x 4 endpoints | ~80ms |
 
-**Total typical critical path: ~280ms** (Metis + Jito, farm hidden under Metis)
-
-With cache misses (rare, after new reserves added):
-- Additional `get_multiple_accounts` for missing reserves + `get_slot` (parallel, ~80ms)
+**Typical critical path: ~280ms** (Metis + Jito, farm hidden under Metis)
 
 ### What Cannot Be Cached
 
-- **Swap quotes**: Real-time from Metis/Jupiter (~200ms)
+- **Swap quotes**: Real-time market data from Metis/Jupiter
 - **Farm user states**: Per-obligation PDAs, fetched each time but hidden in parallel section
-
-### Periodic State Refresh
-
-Market state is refreshed periodically (default: every 4 hours) to catch:
-- New reserves added to markets
-- Configuration changes
-- New oracle accounts
-
-Configurable via `--state-refresh-hours` or `STATE_REFRESH_HOURS` env var.
-
-## Liquidation Orchestrator (`parallel.rs`)
-
-The bot includes an orchestrator module for managing liquidation attempts with deduplication, cooldown tracking, and structured logging.
-
-### Architecture
-
-```
-┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│  Geyser Stream  │────>│  LiquidationOrch.    │────>│  liquidate_fast │
-│  (obligations)  │     │  (dedup + cooldown)  │     │  (sequential)   │
-└─────────────────┘     └──────────────────────┘     └─────────────────┘
-                                  │
-                                  v
-                        ┌──────────────────────┐
-                        │  InFlightTracker     │
-                        │  (prevents duplicates)│
-                        └──────────────────────┘
-```
-
-### Features
-
-1. **Deduplication**: Prevents attempting the same obligation twice simultaneously
-2. **Cooldown Tracking**: Enforces a wait period after each attempt (default: 5 seconds)
-3. **Rate Limiting**: Semaphore-based limit on concurrent attempts (default: 5)
-4. **Structured Logging**: Each attempt gets a unique task ID for filtering logs
-5. **Error Classification**: Categorizes errors for appropriate handling
-6. **Pure Functions**: Core logic in testable pure functions
-
-### Data Types
-
-**LiquidationRequest** - Input data for a liquidation attempt:
-```rust
-struct LiquidationRequest {
-    task_id: u64,              // Unique identifier for logging
-    obligation_pubkey: Pubkey, // The obligation to liquidate
-    obligation: Obligation,    // Deserialized obligation data
-    market_pubkey: Pubkey,     // Which market this belongs to
-    ltv: Fraction,             // Current LTV ratio
-    unhealthy_ltv: Fraction,   // Threshold for liquidation
-    ltv_margin_pct: f64,       // How far over threshold (e.g., 0.05 = 5%)
-    slot: u64,                 // Slot when observed
-    created_at: Instant,       // For latency tracking
-}
-```
-
-**LiquidationOutcome** - Result of an attempt:
-```rust
-enum LiquidationOutcome {
-    Success { task_id, obligation, duration_ms, profit_estimate },
-    RetryableError { task_id, obligation, error, duration_ms },
-    PermanentError { task_id, obligation, error, duration_ms },
-    Skipped { task_id, obligation, reason },
-}
-```
-
-### InFlightTracker
-
-Tracks which obligations are currently being processed:
-
-```rust
-struct InFlightTracker {
-    in_flight: RwLock<HashSet<Pubkey>>,  // Currently processing
-    recent: Arc<RwLock<HashSet<Pubkey>>>, // In cooldown period
-    cooldown: Duration,                   // How long to wait after attempt
-}
-```
-
-**Methods:**
-- `try_acquire(pubkey)` - Returns true if slot acquired, false if already in-flight or cooldown
-- `release(pubkey)` - Releases slot and starts cooldown timer
-- `can_process(pubkey)` - Check without acquiring (for pre-filtering)
-
-### Pure Functions (Testable)
-
-The module uses pure functions for core logic to enable unit testing:
-
-```rust
-// Check if obligation should be skipped
-fn should_skip_liquidation(
-    pubkey: &Pubkey,
-    in_flight: &HashSet<Pubkey>,
-    recent: &HashSet<Pubkey>,
-) -> Option<String>  // Returns skip reason or None
-
-// Classify error for retry decisions
-fn classify_error(error: &str) -> ErrorClassification
-
-// Format log prefix for consistent logging
-fn log_prefix(task_id: u64, obligation: &Pubkey) -> String
-```
-
-### Task ID Format
-
-Logs use the format `[T{task_id}:{obligation_short}]` for easy grep/filtering:
-```
-[T42:8xBnR5kd] Starting liquidation (LTV margin=2.50%)
-[T42:8xBnR5kd] ✓ Liquidation completed
-```
-
-Filter logs for a specific task: `grep "\[T42:" logs.txt`
-
-### Error Classification
-
-Errors are classified to determine retry behavior:
-
-| Classification | Examples | Behavior |
-|----------------|----------|----------|
-| **Permanent** | `ObligationHealthy`, `TOKEN_NOT_TRADABLE`, `InsufficientLiquidity` | Don't retry |
-| **Retryable** | `SlippageToleranceExceeded` (0x1788), `ReserveStale`, `BlockhashNotFound`, `timeout` | Can retry after cooldown |
-| **Unknown** | Other errors | Logged for investigation, treated as retryable once |
-
-### Log Symbols
-
-| Symbol | Meaning |
-|--------|---------|
-| `✓` | Success |
-| `✗` | Permanent error (won't retry) |
-| `⟳` | Retryable error (may retry after cooldown) |
-| `?` | Unknown error (logged for investigation) |
-| `⚠` | Panic caught (klend library issue) |
-
-### Configuration
-
-| Option | Environment Variable | Default | Description |
-|--------|---------------------|---------|-------------|
-| `--max-concurrent` | `MAX_CONCURRENT_LIQUIDATIONS` | 5 | Max simultaneous liquidation attempts |
-| `--cooldown-secs` | `LIQUIDATION_COOLDOWN_SECS` | 5 | Seconds to wait before retrying same obligation |
-
-### Orchestrator Flow
-
-```
-1. Geyser detects liquidatable obligation
-2. orchestrator.try_start(pubkey) called
-   ├─ If in_flight or cooldown → return None (skip)
-   └─ If available → acquire slot, return (task_id, permit)
-3. Execute liquidate_fast()
-4. Log result with task_id prefix
-5. orchestrator.finish(pubkey) releases slot, starts cooldown
-6. After cooldown_secs, obligation can be attempted again
-```
-
-### Statistics
-
-The orchestrator provides monitoring stats:
-
-```rust
-struct OrchestratorStats {
-    in_flight: usize,        // Currently processing
-    cooldown: usize,         // In cooldown period
-    available_permits: usize, // Remaining capacity
-    max_concurrent: usize,   // Configured limit
-    total_submitted: u64,    // Lifetime counter
-}
-```
-
-Display format: `Liquidations: 2/5 active, 3 cooldown, 47 total`
-
-### Why Not True Parallelism?
-
-The Kamino lending library uses `Rc<RefCell<>>` for internal state management, which is not thread-safe (`!Send`). This means liquidation futures cannot be spawned across threads with `tokio::spawn`.
-
-**What this means:**
-- Liquidations execute sequentially on the main thread
-- The orchestrator still provides deduplication and cooldown tracking
-- Multiple liquidatable obligations discovered simultaneously won't cause duplicate attempts
-
-**What would be needed for true parallelism:**
-- Kamino library would need to use `Arc<Mutex<>>` instead of `Rc<RefCell<>>`
-- This is outside our control as it's in the external `kamino_lending` crate
-
-## Configuration
-
-Key environment variables:
-- `RPC_ENDPOINT`: Solana RPC URL (Helius/Triton recommended)
-- `GEYSER_ENDPOINT`: Geyser WebSocket URL for streaming
-- `GEYSER_API_KEY`: API key for Geyser authentication
-- `TITAN_WS_URL`: Titan aggregator WebSocket URL
-- `WALLET_PATH`: Path to liquidator keypair JSON
-- `STATE_REFRESH_HOURS`: How often to refresh market state (default: 4)
-- `MAX_CONCURRENT_LIQUIDATIONS`: Max concurrent liquidation attempts (default: 5)
-- `LIQUIDATION_COOLDOWN_SECS`: Cooldown between attempts on same obligation (default: 5)
-- `LIQUIDATOR_LOOKUP_TABLE_FILE`: Path to lookup tables JSON (default: `liquidator_lookup_tables.json`)
-
-## Non-Tradable Collateral (LP Tokens)
-
-Some Kamino reserves use **LP tokens** as collateral (e.g., kUXDUSDCOrca, Orca LP shares). These tokens cannot be swapped on DEX aggregators like Jupiter/Metis because they represent shares in a liquidity pool, not fungible tokens.
-
-### Example Error
-```
-Metis quote failed: 400 Bad Request - {"error":"The token 4G9USgnbg6fDTQ5AUfpCjM89zqbzWj32xfqvsaAu66DM is not tradable","errorCode":"TOKEN_NOT_TRADABLE"}
-```
-
-### Current Behavior
-Flash loan liquidations are **skipped** when the collateral token is not tradable. The liquidator logs a warning and moves on.
-
-### Why This Happens
-1. LP tokens represent pool shares, not a simple token balance
-2. Converting them requires **withdrawing from the LP position** first
-3. DEX aggregators don't support this multi-step conversion
-
-### Known Non-Tradable Token Types
-| Token Type | Example | Reason |
-|------------|---------|--------|
-| Kamino kTokens | kUXDUSDCOrca | Vault share tokens |
-| Orca LP tokens | Various Orca pools | Concentrated liquidity positions |
-| Raydium LP tokens | Various Raydium pools | AMM pool shares |
-
-### Future Improvements
-To liquidate positions with LP collateral, the bot would need to:
-1. Flash borrow the debt token
-2. Liquidate and receive LP tokens
-3. **Withdraw from the LP** to get underlying tokens
-4. Swap underlying tokens to debt token
-5. Repay flash loan
-
-This requires custom logic for each LP type (Orca, Raydium, Kamino vaults, etc.).
-
-### Alternative: Non-Flash-Loan Liquidation
-If the liquidator already holds the debt token, it can use the `LiquidateAndRedeem` strategy:
-- No swap needed - keep the LP tokens as profit
-- Manually withdraw from LP later
-- Useful for accumulating LP positions at a discount
-
-## Error Handling
-
-Common errors and their causes:
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `ReserveStale` | Not all obligation reserves refreshed | Refresh ALL deposit and borrow reserves |
-| `InvalidFlashRepay` | Wrong borrow instruction index | Account for ComputeBudget instructions (index = base + 2) |
-| `NoValidRoute` | Titan can't find swap path or empty quotes | Skip liquidation - no liquidity for this pair |
-| `TOKEN_NOT_TRADABLE` | Collateral is LP token (kToken, Orca LP, etc.) | Skip - LP tokens can't be swapped directly |
-| `IncorrectProgramId` | Token-2022 mint with SPL Token ATA | Detect token program and use correct one |
-| `Timeout` | Titan WebSocket timeout | Service may be down, retry later |
-| `TransactionTooLarge` | TX exceeds 1232 bytes | Position has too many collaterals (5+) |
-
-## Running the Bot
-
-```bash
-# Build
-cargo build --release
-
-# Run (simulation mode)
-SHOULD_SEND=false cargo run --release
-
-# Run (live mode)
-SHOULD_SEND=true cargo run --release
-```
-
-The bot will:
-1. Load all Kamino reserves and markets
-2. Create/extend Address Lookup Tables for each market
-3. Create ATAs for all token mints
-4. Connect to Geyser and subscribe to obligations (after init to prevent channel overflow)
-5. Monitor for unhealthy positions
-6. Execute flash loan liquidations when profitable

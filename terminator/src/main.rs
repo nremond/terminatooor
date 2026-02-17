@@ -984,7 +984,7 @@ async fn liquidate_fast(
         })
         .collect();
 
-    let max_allowed_ltv_override_pct_opt = Some(10);
+    let max_allowed_ltv_override_pct_opt = None;
     let liquidation_swap_slippage_pct = 0.5;
     let min_acceptable_received_collateral_amount = 1;
     let liquidation_strategy = math::decide_liquidation_strategy(

@@ -10,6 +10,7 @@ use anchor_client::{
     solana_sdk::{
         address_lookup_table_account::AddressLookupTableAccount,
         commitment_config::CommitmentConfig,
+        hash::Hash,
         instruction::Instruction,
         message::{v0, VersionedMessage},
         pubkey::Pubkey,
@@ -18,6 +19,7 @@ use anchor_client::{
         transaction::{TransactionError, VersionedTransaction},
     },
 };
+use tokio::sync::watch;
 use errors::ErrorKind;
 use futures::future::join_all;
 
@@ -72,6 +74,7 @@ where
     lookup_tables: Vec<AddressLookupTableAccount>,
     commitment_config: CommitmentConfig,
     fee_cache: FeeCache,
+    blockhash_rx: Option<watch::Receiver<Hash>>,
 }
 
 impl<T, S> OrbitLink<T, S>
@@ -108,6 +111,7 @@ where
             lookup_tables: lookup_tables.unwrap_or_default(),
             commitment_config,
             fee_cache,
+            blockhash_rx: None,
         })
     }
 
@@ -148,6 +152,23 @@ where
             self.refresh_fee_cache().await?;
         }
         Ok(())
+    }
+
+    /// Set a background-refreshed blockhash cache to avoid per-tx RPC calls.
+    pub fn set_blockhash_cache(&mut self, rx: watch::Receiver<Hash>) {
+        self.blockhash_rx = Some(rx);
+    }
+
+    /// Get the latest blockhash, using the background cache if available, falling back to RPC.
+    async fn get_blockhash(&self) -> Result<Hash> {
+        if let Some(rx) = &self.blockhash_rx {
+            let hash = *rx.borrow();
+            if hash != Hash::default() {
+                return Ok(hash);
+            }
+            warn!("Blockhash cache not yet populated, falling back to RPC");
+        }
+        self.client.get_latest_blockhash().await
     }
 
     pub fn get_recommended_micro_lamport_fee(&self) -> u64 {
@@ -209,7 +230,7 @@ where
                 &payer.pubkey(),
                 instructions,
                 &self.lookup_tables,
-                self.client.get_latest_blockhash().await?,
+                self.get_blockhash().await?,
             )?),
             &signers,
         )?)
@@ -244,7 +265,7 @@ where
                 &self.payer.as_ref().unwrap().pubkey(),
                 instructions,
                 &lookup_tables,
-                self.client.get_latest_blockhash().await?,
+                self.get_blockhash().await?,
             )?),
             &signers,
         )?)
@@ -451,4 +472,34 @@ struct TransactionAndStatus<'a> {
     tx: &'a VersionedTransaction,
     sig: Signature,
     result: Option<TransactionResult>,
+}
+
+/// Spawn a background task that refreshes the latest blockhash on an interval.
+/// Returns a `watch::Receiver` to pass to `OrbitLink::set_blockhash_cache()`.
+pub fn spawn_blockhash_refresher(
+    rpc_url: String,
+    interval: Duration,
+) -> (watch::Receiver<Hash>, tokio::task::JoinHandle<()>) {
+    use solana_client::nonblocking::rpc_client::RpcClient;
+
+    let (tx, rx) = watch::channel(Hash::default());
+    let handle = tokio::spawn(async move {
+        let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::finalized());
+        loop {
+            match client
+                .get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
+                .await
+            {
+                Ok((hash, _)) => {
+                    let _ = tx.send(hash);
+                    debug!("Blockhash cache refreshed: {}", hash);
+                }
+                Err(e) => {
+                    warn!("Failed to refresh blockhash cache: {:?}", e);
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+    (rx, handle)
 }

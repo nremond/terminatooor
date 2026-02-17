@@ -235,7 +235,16 @@ async fn main() -> Result<()> {
     info!("Starting with {:#?}", args);
 
     info!("Initializing client..");
-    let klend_client = config::get_client_for_action(&args)?;
+    let mut klend_client = config::get_client_for_action(&args)?;
+
+    // Start background blockhash refresher to eliminate per-tx RPC calls (~40-80ms savings)
+    let (blockhash_rx, _blockhash_task) = orbit_link::spawn_blockhash_refresher(
+        args.rpc_url.url().to_string(),
+        Duration::from_secs(2),
+    );
+    klend_client.client.set_blockhash_cache(blockhash_rx);
+    info!("Blockhash background cache started (refresh every 2s)");
+
     let klend_client = Arc::new(klend_client);
 
     it_event!("klend_terminator::started");
@@ -843,6 +852,7 @@ async fn liquidate_fast(
     _ltv_margin_pct: f64,
     log_prefix: &str,
     oracle_cache: &geyser::OracleCache,
+    reserve_cache: &geyser::ReserveCache,
 ) -> Result<()> {
     let liq_start = std::time::Instant::now();
     info!("{} Liquidating obligation (fast path)", log_prefix);
@@ -870,39 +880,47 @@ async fn liquidate_fast(
         }
     }
 
-    // Fetch fresh reserves in a single batch RPC call to avoid stale cumulative_borrow_rate
-    // This prevents NegativeInterestRate errors when obligation was refreshed more recently than cached reserves
-    info!("{} Fetching fresh {} reserves (batch)", log_prefix, obligation_reserve_keys.len());
-    let reserve_accounts = klend_client
-        .client
-        .client
-        .get_multiple_accounts(&obligation_reserve_keys)
-        .await
-        .unwrap_or_default();
-    for (i, account_opt) in reserve_accounts.iter().enumerate() {
-        let reserve_key = &obligation_reserve_keys[i];
-        if let Some(account) = account_opt {
-            match Reserve::try_deserialize(&mut account.data.as_slice()) {
-                Ok(fresh_reserve) => {
-                    reserves.insert(*reserve_key, fresh_reserve);
-                }
-                Err(e) => {
-                    warn!("{} Failed to deserialize reserve {}: {:?}, using cached", log_prefix, reserve_key, e);
-                }
-            }
+    // Use Geyser-cached reserves instead of RPC fetch (saves 50-150ms)
+    let cached_reserves = reserve_cache.get_reserves(&obligation_reserve_keys);
+    let mut cache_misses: Vec<Pubkey> = Vec::new();
+    for key in &obligation_reserve_keys {
+        if let Some(fresh_reserve) = cached_reserves.get(key) {
+            reserves.insert(*key, *fresh_reserve);
         } else {
-            warn!("{} Reserve {} not found, using cached", log_prefix, reserve_key);
+            cache_misses.push(*key);
         }
     }
-    debug!("{} Using {} reserves for market {}", log_prefix, reserves.len(), ob.lending_market);
-    info!("{} Reserves fetched in {}ms", log_prefix, liq_start.elapsed().as_millis());
 
-    // Use the maximum slot from all sources plus a buffer to ensure clock is not behind any data.
-    // RPC slot can lag behind Geyser or fetched data due to different endpoints/caching.
-    // The buffer accounts for this lag and prevents "reserve stale" errors.
-    let rpc_slot = klend_client.client.client.get_slot().await.unwrap_or(slot);
+    // Fallback: fetch any cache misses via RPC (parallel with get_slot if needed)
+    let rpc_slot = if !cache_misses.is_empty() {
+        warn!("{} {} reserves not in Geyser cache, fetching via RPC: {:?}", log_prefix, cache_misses.len(), cache_misses);
+        let (fallback_result, rpc_slot_result) = tokio::join!(
+            klend_client.client.client.get_multiple_accounts(&cache_misses),
+            klend_client.client.client.get_slot()
+        );
+        let fallback_accounts = fallback_result.unwrap_or_default();
+        for (i, account_opt) in fallback_accounts.iter().enumerate() {
+            if let Some(account) = account_opt {
+                match Reserve::try_deserialize(&mut account.data.as_slice()) {
+                    Ok(fresh_reserve) => {
+                        reserves.insert(cache_misses[i], fresh_reserve);
+                    }
+                    Err(e) => {
+                        warn!("{} Failed to deserialize reserve {}: {:?}, using cached", log_prefix, cache_misses[i], e);
+                    }
+                }
+            }
+        }
+        rpc_slot_result.unwrap_or(slot)
+    } else {
+        // All reserves cached — use Geyser slot directly (skip get_slot RPC)
+        slot
+    };
+
+    debug!("{} Using {} reserves for market {}", log_prefix, reserves.len(), ob.lending_market);
+    info!("{} Reserves loaded in {}ms (cache_misses={})", log_prefix, liq_start.elapsed().as_millis(), cache_misses.len());
     let clock_slot = calculate_clock_slot(rpc_slot, slot);
-    info!("{} RPC slot={} geyser slot={} delta={} (total {}ms)", log_prefix, rpc_slot, slot, rpc_slot as i64 - slot as i64, liq_start.elapsed().as_millis());
+    info!("{} slot={} (rpc={} geyser={}) (total {}ms)", log_prefix, clock_slot, rpc_slot, slot, liq_start.elapsed().as_millis());
     let clock = solana_sdk::clock::Clock {
         slot: clock_slot,
         epoch_start_timestamp: 0,
@@ -1050,26 +1068,29 @@ async fn liquidate_fast(
         // This saves ~200-350ms by overlapping the instruction building RPC calls with the Metis API call
         let parallel_start = std::time::Instant::now();
 
-        // Pre-fetch farm user states to eliminate ~60ms RPC latency during instruction building
-        let debt_res_ref = debt_reserve.state.borrow();
-        let coll_res_ref = coll_reserve.state.borrow();
-        let reserves_for_prefetch: Vec<(&Pubkey, &Reserve)> = vec![
-            (&debt_res_key, &*debt_res_ref),
-            (&coll_res_key, &*coll_res_ref),
-        ];
-        let farm_cache = client::prefetch_farm_user_states(
-            &klend_client.client.client,
-            obligation_pubkey,
-            &reserves_for_prefetch,
-        ).await;
-        drop(debt_res_ref);
-        drop(coll_res_ref);
-        debug!("{} Pre-fetched {} farm user states in {}ms", log_prefix, farm_cache.len(), parallel_start.elapsed().as_millis());
+        // Copy reserve states for farm pre-fetch (avoids RefCell borrow across await)
+        let debt_reserve_state_copy = *debt_reserve.state.borrow();
+        let coll_reserve_state_copy = *coll_reserve.state.borrow();
 
         let log_prefix_owned = log_prefix.to_string();
         let reserves_for_cache = reserves.clone();
         let liquidate_ixns_future = async {
             let start = std::time::Instant::now();
+
+            // Pre-fetch farm user states INSIDE the parallel section
+            // This runs concurrently with the swap quote (saves 50-80ms vs sequential)
+            let reserves_for_prefetch: Vec<(&Pubkey, &Reserve)> = vec![
+                (&debt_res_key, &debt_reserve_state_copy),
+                (&coll_res_key, &coll_reserve_state_copy),
+            ];
+            let farm_cache = client::prefetch_farm_user_states(
+                &klend_client.client.client,
+                obligation_pubkey,
+                &reserves_for_prefetch,
+            ).await;
+            debug!("{} Pre-fetched {} farm user states in {}ms", log_prefix_owned, farm_cache.len(), start.elapsed().as_millis());
+
+            // Then build liquidation instructions using the farm cache
             let result = klend_client.liquidate_obligation_and_redeem_reserve_collateral_ixns(
                 lending_market.clone(),
                 debt_reserve.clone(),
@@ -1079,10 +1100,10 @@ async fn liquidate_fast(
                 min_acceptable_received_collateral_amount,
                 max_allowed_ltv_override_pct_opt,
                 false, // Must include post-farm refresh for on-chain validation
-                Some(&reserves_for_cache), // Pass cached reserves to avoid RPC calls
-                Some(&farm_cache), // Pass pre-fetched farm user states to avoid RPC calls
+                Some(&reserves_for_cache),
+                Some(&farm_cache),
             ).await;
-            debug!("{} Liquidation ixns built in {}ms", log_prefix_owned, start.elapsed().as_millis());
+            debug!("{} Liquidation ixns built in {}ms (incl. farm prefetch)", log_prefix_owned, start.elapsed().as_millis());
             result
         };
 
@@ -1586,12 +1607,20 @@ async fn crank_stream(
     }
     info!("Collected {} oracle accounts for streaming", oracle_accounts.len());
 
+    // Collect all reserve account pubkeys for real-time streaming
+    let mut reserve_accounts: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+    for state in market_states.values() {
+        reserve_accounts.extend(state.reserves.keys());
+    }
+    info!("Collected {} reserve accounts for streaming", reserve_accounts.len());
+
     // Connect to Geyser AFTER initialization is complete
     let geyser_config = GeyserConfig {
         endpoint: geyser_endpoint,
         api_key: geyser_api_key,
         program_id: klend_client.program_id,
         oracle_accounts,
+        reserve_accounts,
     };
 
     let mut geyser_stream = GeyserStream::connect(geyser_config).await?;
@@ -1606,6 +1635,12 @@ async fn crank_stream(
         );
     }
     info!("Oracle cache initialized with {} accounts", geyser_stream.oracle_cache().len());
+
+    // Initialize reserve cache with existing data from market states
+    for state in market_states.values() {
+        geyser_stream.reserve_cache().init_from_reserves(&state.reserves);
+    }
+    info!("Reserve cache initialized with {} accounts", geyser_stream.reserve_cache().len());
 
     // Create the parallel liquidation orchestrator (wrapped in Arc for sharing across tasks)
     let orchestrator = Arc::new(parallel::LiquidationOrchestrator::new(parallel_config.clone()));
@@ -1726,6 +1761,7 @@ async fn crank_stream(
                                             ltv_margin_pct,
                                             &prefix,
                                             geyser_stream.oracle_cache(),
+                                            geyser_stream.reserve_cache(),
                                         )).catch_unwind().await;
 
                                         match liquidation_result {

@@ -97,11 +97,15 @@ Typical values:
 ## Architecture Components
 
 ### 1. Geyser Streaming (`geyser.rs`)
-Real-time account monitoring via Triton/Helius WebSocket:
-- Subscribes to all Kamino obligation accounts
+Real-time account monitoring via Helius LaserStream (Yellowstone gRPC):
+- Subscribes to all Kamino obligation accounts (by program owner)
+- Subscribes to oracle accounts (Pyth, Switchboard, Scope) by specific pubkey
+- Subscribes to reserve accounts by specific pubkey for real-time reserve data
 - Receives instant updates when positions become unhealthy
 - Much faster than polling RPC endpoints
-- **Initialization order**: Geyser connection is deferred until AFTER market state loading to prevent channel overflow during startup
+- **OracleCache**: Thread-safe `Arc<RwLock<HashMap>>` updated on each Geyser oracle update, with slot-based staleness protection
+- **ReserveCache**: Thread-safe `Arc<RwLock<HashMap>>` storing deserialized `Reserve` structs, updated on each Geyser reserve update. Deserialization happens on the write path (off the critical liquidation path) so reads are instant
+- **Initialization order**: Geyser connection is deferred until AFTER market state loading to prevent channel overflow during startup. Caches are seeded from loaded market state before streaming begins
 - **Auto-reconnect**: Automatic reconnection with exponential backoff (500ms → 60s max)
 - **Stale connection detection**: If no messages received for 2 minutes, connection is considered stale and reconnects
 - **Connection timeout**: 30 second timeout for initial connection
@@ -118,8 +122,8 @@ Fetches token prices from multiple sources:
 - Switchboard
 - Scope (Kamino's price aggregator)
 
-### 4. Swap Router (`titan.rs`, `routing.rs`)
-Gets optimal swap routes via Titan aggregator:
+### 4. Swap Router (`routing.rs`, `metis.rs`)
+Gets optimal swap routes via Metis/Jupiter aggregator:
 - Connects via WebSocket for streaming quotes
 - Supports all major Solana DEXes
 - Returns transaction instructions for the best route
@@ -236,7 +240,7 @@ Index  Instruction
 4      refresh_reserve (debt)
 5      refresh_obligation
 6      liquidate_obligation_and_redeem_reserve_collateral
-7-N    swap instructions (from Titan)
+7-N    swap instructions (from Metis/Jupiter)
 N+1    flash_repay_reserve_liquidity(borrow_index=2)
 ```
 
@@ -244,35 +248,68 @@ The `flash_repay` instruction references the `flash_borrow` by its index, allowi
 
 ## Hot Path Optimizations
 
-Speed is critical for liquidations - positions can become healthy again within seconds. The bot uses several optimizations to minimize latency.
+Speed is critical for liquidations - positions can become healthy again within seconds. The bot uses several optimizations to minimize latency on the critical path from Geyser update to Jito submission.
 
-### Cached Data (MarketState)
+### Cached Data
 
-At startup and during periodic refresh, the bot caches:
-- **Reserves**: All reserve data for each market
-- **Referrer token states**: Fee distribution accounts
-- **Oracle accounts**: Pyth, Switchboard, Scope price data
-- **Lookup tables**: Address lookup tables loaded once, then cached in memory
+At startup and during periodic refresh, the bot seeds several caches:
+- **MarketState**: Reserves, referrer token states, oracle data for each market
+- **OracleCache**: Real-time oracle prices streamed via Geyser (no RPC needed)
+- **ReserveCache**: Real-time reserve data streamed via Geyser (no RPC needed)
+- **BlockhashCache**: Background task refreshes blockhash every 2s via `tokio::sync::watch` channel
+- **Lookup tables**: Address lookup tables loaded once at startup, then cached in memory
 
 ### Fast Liquidation Path (`liquidate_fast`)
 
-When a liquidatable position is detected via Geyser, the bot uses cached data instead of making redundant RPC calls:
+When a liquidatable position is detected via Geyser, the bot uses cached/streamed data instead of making RPC calls:
 
-| Data | Slow Path | Fast Path |
-|------|-----------|-----------|
-| Obligation | RPC fetch (~140ms) | From Geyser update |
-| Reserves | RPC fetch (~75ms) | From MarketState cache |
-| Referrer states | RPC fetch (~50ms) | From MarketState cache |
-| Clock/slot | RPC fetch (~50ms) | From Geyser update |
-| Lookup tables | RPC fetch × 26 (~1100ms) | Memory cache |
-| Oracle prices | RPC fetch (~100ms) | RPC fetch (required) |
+| Data | Before | After |
+|------|--------|-------|
+| Obligation | RPC fetch (~140ms) | From Geyser update (0ms) |
+| Reserves | RPC batch fetch (~75ms) | From Geyser ReserveCache (0ms) |
+| Oracle prices | RPC fetch (~100ms) | From Geyser OracleCache (0ms) |
+| Referrer states | RPC fetch (~50ms) | From MarketState cache (0ms) |
+| Clock/slot | RPC getSlot (~40ms) | From Geyser slot + buffer (0ms) |
+| Blockhash | RPC fetch per tx (~50ms) | Background cache (0ms) |
+| Lookup tables | RPC fetch × N (~1100ms) | Memory cache (0ms) |
+| Farm user states | Sequential RPC (~60ms) | Parallel with swap quote (0ms extra) |
+| Swap quotes | HTTP to Metis (~200ms) | HTTP to Metis (~200ms, unavoidable) |
 
-**Total savings: ~300-400ms per liquidation attempt**
+### Parallel Execution
+
+The critical path uses `tokio::join!` to overlap independent operations:
+
+```
+Reserve cache read (0ms) ──┐
+                           ├── Parallel if cache misses
+get_slot fallback (40ms) ──┘
+
+Farm prefetch (60ms) ──────┐
+                           ├── tokio::join! (max of both, not sum)
+Metis swap quote (200ms) ──┘
+
+Build tx (cached blockhash, 0ms) ──> Jito submit (4 endpoints race, 80ms)
+```
+
+### RPC Calls Per Liquidation (Typical)
+
+With all caches warm (the common case after startup):
+
+| Call | When | Latency |
+|------|------|---------|
+| `get_multiple_accounts` (farm states) | Always (inside parallel section) | ~60ms (hidden under swap) |
+| Metis API `/quote` + `/swap-instructions` | When collateral != debt | ~200ms |
+| Jito `send_bundle` × 4 endpoints | Always (parallel, first wins) | ~80ms |
+
+**Total typical critical path: ~280ms** (Metis + Jito, farm hidden under Metis)
+
+With cache misses (rare, after new reserves added):
+- Additional `get_multiple_accounts` for missing reserves + `get_slot` (parallel, ~80ms)
 
 ### What Cannot Be Cached
 
-- **Oracle prices**: Must be fresh for accurate LTV simulation
-- **Swap quotes**: Real-time from Titan (~550ms)
+- **Swap quotes**: Real-time from Metis/Jupiter (~200ms)
+- **Farm user states**: Per-obligation PDAs, fetched each time but hidden in parallel section
 
 ### Periodic State Refresh
 

@@ -9,9 +9,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anchor_lang::prelude::Pubkey;
+use anchor_lang::AccountDeserialize;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use anchor_client::solana_sdk::account::Account;
+use kamino_lending::Reserve;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
@@ -31,6 +33,8 @@ pub struct GeyserConfig {
     pub program_id: Pubkey,
     /// Oracle account pubkeys to stream (Pyth, Switchboard, Scope)
     pub oracle_accounts: HashSet<Pubkey>,
+    /// Reserve account pubkeys to stream for real-time reserve data
+    pub reserve_accounts: HashSet<Pubkey>,
 }
 
 /// Thread-safe cache for oracle account data
@@ -131,6 +135,82 @@ impl Default for OracleCache {
     }
 }
 
+/// Thread-safe cache for reserve account data
+/// Updated in real-time via Geyser stream, deserialized on write for instant reads
+#[derive(Debug, Clone)]
+pub struct ReserveCache {
+    /// Map from reserve pubkey to (slot, deserialized_reserve)
+    inner: Arc<RwLock<HashMap<Pubkey, (u64, Reserve)>>>,
+}
+
+impl ReserveCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Initialize from existing market state reserves
+    pub fn init_from_reserves(&self, reserves: &HashMap<Pubkey, Reserve>) {
+        let mut cache = self.inner.write().unwrap();
+        for (pubkey, reserve) in reserves {
+            cache.insert(*pubkey, (0, *reserve));
+        }
+        info!("Reserve cache initialized with {} accounts", cache.len());
+    }
+
+    /// Update a reserve account in the cache (deserializes raw data on write)
+    pub fn update(&self, pubkey: Pubkey, slot: u64, data: Vec<u8>) {
+        // Deserialize on the Geyser update path (off the critical liquidation path)
+        match Reserve::try_deserialize(&mut data.as_slice()) {
+            Ok(reserve) => {
+                let mut cache = self.inner.write().unwrap();
+                if let Some((existing_slot, _)) = cache.get(&pubkey) {
+                    if slot <= *existing_slot {
+                        return; // Ignore stale updates
+                    }
+                }
+                cache.insert(pubkey, (slot, reserve));
+            }
+            Err(e) => {
+                debug!("Failed to deserialize reserve {}: {:?}", pubkey, e);
+            }
+        }
+    }
+
+    /// Get a single cached reserve
+    pub fn get_reserve(&self, pubkey: &Pubkey) -> Option<Reserve> {
+        self.inner.read().unwrap().get(pubkey).map(|(_, r)| *r)
+    }
+
+    /// Get multiple reserves, returning a map of those found in cache
+    pub fn get_reserves(&self, pubkeys: &[Pubkey]) -> HashMap<Pubkey, Reserve> {
+        let cache = self.inner.read().unwrap();
+        let mut result = HashMap::new();
+        for pk in pubkeys {
+            if let Some((_, reserve)) = cache.get(pk) {
+                result.insert(*pk, *reserve);
+            }
+        }
+        result
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().unwrap().len()
+    }
+
+    #[allow(dead_code)]
+    pub fn contains(&self, pubkey: &Pubkey) -> bool {
+        self.inner.read().unwrap().contains_key(pubkey)
+    }
+}
+
+impl Default for ReserveCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An update received from the Geyser stream
 #[derive(Debug, Clone)]
 pub struct ObligationUpdate {
@@ -153,6 +233,8 @@ pub struct GeyserStream {
     _task_handle: tokio::task::JoinHandle<()>,
     /// Shared oracle cache updated by the stream
     oracle_cache: OracleCache,
+    /// Shared reserve cache updated by the stream
+    reserve_cache: ReserveCache,
 }
 
 impl GeyserStream {
@@ -160,11 +242,13 @@ impl GeyserStream {
     pub async fn connect(config: GeyserConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(1000);
         let oracle_cache = OracleCache::new();
+        let reserve_cache = ReserveCache::new();
 
         let config_clone = config.clone();
         let oracle_cache_clone = oracle_cache.clone();
+        let reserve_cache_clone = reserve_cache.clone();
         let task_handle = tokio::spawn(async move {
-            run_stream_with_reconnect(config_clone, tx, oracle_cache_clone).await;
+            run_stream_with_reconnect(config_clone, tx, oracle_cache_clone, reserve_cache_clone).await;
         });
 
         Ok(Self {
@@ -172,12 +256,18 @@ impl GeyserStream {
             rx,
             _task_handle: task_handle,
             oracle_cache,
+            reserve_cache,
         })
     }
 
     /// Get a reference to the oracle cache
     pub fn oracle_cache(&self) -> &OracleCache {
         &self.oracle_cache
+    }
+
+    /// Get a reference to the reserve cache
+    pub fn reserve_cache(&self) -> &ReserveCache {
+        &self.reserve_cache
     }
 
     /// Receive the next obligation update
@@ -204,6 +294,7 @@ async fn run_stream_with_reconnect(
     config: GeyserConfig,
     tx: mpsc::Sender<ObligationUpdate>,
     oracle_cache: OracleCache,
+    reserve_cache: ReserveCache,
 ) {
     let mut consecutive_failures: u32 = 0;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -212,7 +303,7 @@ async fn run_stream_with_reconnect(
     loop {
         info!("Connecting to Geyser stream at {} (attempt {})", config.endpoint, consecutive_failures + 1);
 
-        match connect_and_stream(&config, &tx, &oracle_cache).await {
+        match connect_and_stream(&config, &tx, &oracle_cache, &reserve_cache).await {
             Ok(()) => {
                 // Stream ended gracefully (server closed connection)
                 warn!("Geyser stream ended gracefully, will reconnect...");
@@ -244,6 +335,7 @@ async fn connect_and_stream(
     config: &GeyserConfig,
     tx: &mpsc::Sender<ObligationUpdate>,
     oracle_cache: &OracleCache,
+    reserve_cache: &ReserveCache,
 ) -> Result<()> {
     // Connect to Helius LaserStream using the builder pattern with timeout
     let connect_timeout = Duration::from_secs(30);
@@ -292,7 +384,25 @@ async fn connect_and_stream(
             "oracle_accounts".to_string(),
             SubscribeRequestFilterAccounts {
                 account: oracle_pubkeys,
-                owner: vec![], // No owner filter - subscribe by specific pubkey
+                owner: vec![],
+                filters: vec![],
+            },
+        );
+    }
+
+    // Subscribe to reserve accounts for real-time reserve data (eliminates RPC fetch in liquidate_fast)
+    if !config.reserve_accounts.is_empty() {
+        let reserve_pubkeys: Vec<String> = config
+            .reserve_accounts
+            .iter()
+            .map(|pk| pk.to_string())
+            .collect();
+        info!("Subscribing to {} reserve accounts", reserve_pubkeys.len());
+        accounts_filter.insert(
+            "reserve_accounts".to_string(),
+            SubscribeRequestFilterAccounts {
+                account: reserve_pubkeys,
+                owner: vec![],
                 filters: vec![],
             },
         );
@@ -318,9 +428,10 @@ async fn connect_and_stream(
         .map_err(|e| anyhow!("Failed to subscribe: {:?}", e))?;
 
     info!(
-        "Subscribed to Kamino obligations (program {}) and {} oracle accounts",
+        "Subscribed to Kamino obligations (program {}), {} oracle accounts, {} reserve accounts",
         config.program_id,
-        config.oracle_accounts.len()
+        config.oracle_accounts.len(),
+        config.reserve_accounts.len()
     );
 
     // Process incoming messages with a receive timeout
@@ -341,7 +452,7 @@ async fn connect_and_stream(
                 match message {
                     Ok(msg) => {
                         if let Some(update_oneof) = msg.update_oneof {
-                            if let Err(e) = process_update(update_oneof, tx, oracle_cache, &config.oracle_accounts).await {
+                            if let Err(e) = process_update(update_oneof, tx, oracle_cache, reserve_cache, &config.oracle_accounts, &config.reserve_accounts).await {
                                 warn!("Error processing message: {:?}", e);
                             }
                         }
@@ -379,7 +490,9 @@ async fn process_update(
     update: UpdateOneof,
     tx: &mpsc::Sender<ObligationUpdate>,
     oracle_cache: &OracleCache,
+    reserve_cache: &ReserveCache,
     oracle_pubkeys: &HashSet<Pubkey>,
+    reserve_pubkeys: &HashSet<Pubkey>,
 ) -> Result<()> {
     match update {
         UpdateOneof::Account(account_update) => {
@@ -399,6 +512,13 @@ async fn process_update(
             if oracle_pubkeys.contains(&pubkey) {
                 oracle_cache.update(pubkey, slot, account.data);
                 debug!("Updated oracle cache: {} at slot {}", pubkey, slot);
+                return Ok(());
+            }
+
+            // Check if this is a reserve account update
+            if reserve_pubkeys.contains(&pubkey) {
+                reserve_cache.update(pubkey, slot, account.data);
+                debug!("Updated reserve cache: {} at slot {}", pubkey, slot);
                 return Ok(());
             }
 

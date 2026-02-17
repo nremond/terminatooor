@@ -26,7 +26,8 @@ tracing-subscriber = { version = "0.3.9", features = ["std", "fmt", "json", "env
 tokio = "1.14.1"
 warp = "0.3.3"
 nohash-hasher = "0.2.0"
-orbit-link = { git = "https://github.com/Kamino-Finance/orbit-link" }
+solana-client = "~1.17.18"
+solana-transaction-status = "~1.17.18"
 async-trait = "0.1.51"
 futures = "0.3.18"
 colored = "2.0.4"

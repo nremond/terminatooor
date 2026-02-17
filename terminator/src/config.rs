@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anchor_lang::prelude::Pubkey;
 use anyhow::{anyhow, Result};
-use orbit_link::OrbitLink;
+use crate::orbit_link::OrbitLink;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,

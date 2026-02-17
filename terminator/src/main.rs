@@ -52,6 +52,7 @@ pub mod consts;
 pub mod geyser;
 pub mod instructions;
 pub mod jito;
+pub mod orbit_link;
 pub mod routing;
 pub mod liquidator;
 pub mod lookup_tables;

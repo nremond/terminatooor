@@ -22,7 +22,7 @@ use anyhow::{anyhow, Result};
 use kamino_lending::{
     utils::seeds, LendingMarket, Obligation, ReferrerTokenState, Reserve, ReserveFarmKind,
 };
-use orbit_link::OrbitLink;
+use crate::orbit_link::OrbitLink;
 use solana_sdk::{
     address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount},
     commitment_config::CommitmentConfig,
@@ -1217,7 +1217,7 @@ pub mod rpc {
     };
     use anchor_lang::{Discriminator, Owner};
     use bytemuck::{from_bytes, AnyBitPattern};
-    use orbit_link::OrbitLink;
+    use crate::orbit_link::OrbitLink;
     use solana_account_decoder::UiAccountEncoding;
     use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 

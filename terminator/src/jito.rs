@@ -227,7 +227,8 @@ impl JitoClient {
                                 } else {
                                     p95
                                 };
-                                let lamports = (p90 * 1e9) as u64;
+                                const MAX_TIP_LAMPORTS: u64 = 10_000_000; // 0.01 SOL
+                                let lamports = ((p90 * 1e9) as u64).min(MAX_TIP_LAMPORTS);
                                 if lamports > 0 {
                                     self.dynamic_tip_lamports.store(lamports, Ordering::Relaxed);
                                     info!(

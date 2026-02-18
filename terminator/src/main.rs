@@ -1363,7 +1363,7 @@ async fn liquidate_fast(
 
             match JITO_CLIENT.send_bundle(vec![txn.clone()]).await {
                 Ok((bundle_id, endpoint)) => {
-                    info!("{} ✓ Jito bundle submitted via {} in {}ms: {}", log_prefix, endpoint, liq_start.elapsed().as_millis(), bundle_id);
+                    info!("{} ✓ Jito bundle submitted via {} in {}ms (tip: {} lamports): {}", log_prefix, endpoint, liq_start.elapsed().as_millis(), JITO_CLIENT.tip_lamports(), bundle_id);
                 }
                 Err(e) => {
                     warn!("{} ✗ Jito bundle failed: {:?}, falling back to RPC", log_prefix, e);

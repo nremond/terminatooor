@@ -82,7 +82,7 @@ pub struct Args {
     #[clap(long, env, parse(try_from_str), default_value = "localnet")]
     rpc_url: Cluster,
 
-    /// Dedicated RPC URL for getProgramAccounts calls (faster startup with Helius)
+    /// Dedicated RPC URL for getProgramAccounts calls (faster startup)
     #[clap(long, env)]
     gpa_rpc_url: Option<String>,
 
@@ -112,12 +112,11 @@ pub struct Args {
     #[clap(long, env, default_value = "8080")]
     server_port: u16,
 
-    /// Helius LaserStream/Geyser endpoint URL
-    /// Example: https://laserstream-mainnet-ewr.helius-rpc.com
+    /// Yellowstone gRPC endpoint URL
     #[clap(long, env = "GEYSER_ENDPOINT")]
     geyser_endpoint: Option<String>,
 
-    /// API key for Geyser/LaserStream authentication (Helius, Triton, etc.)
+    /// API key for Yellowstone gRPC authentication (x-token)
     #[clap(long, env = "GEYSER_API_KEY")]
     geyser_api_key: Option<String>,
 
@@ -161,8 +160,8 @@ pub enum Actions {
         #[clap(flatten)]
         rebalance_args: RebalanceArgs,
     },
-    /// Stream obligation updates via Geyser/LaserStream for real-time monitoring
-    /// Requires --geyser-endpoint and --helius-api-key to be set
+    /// Stream obligation updates via Yellowstone gRPC for real-time monitoring
+    /// Requires --geyser-endpoint and --geyser-api-key to be set
     #[clap()]
     CrankStream {
         #[clap(flatten)]
@@ -1565,7 +1564,7 @@ async fn crank(klend_client: &KlendClient, obligation_filter: Option<Pubkey>) ->
     }
 }
 
-/// Stream-based crank using Geyser/LaserStream for real-time obligation monitoring.
+/// Stream-based crank using Yellowstone gRPC for real-time obligation monitoring.
 /// This is significantly faster than RPC polling as it receives updates within ~50-100ms
 /// of on-chain state changes.
 async fn crank_stream(
@@ -1576,7 +1575,7 @@ async fn crank_stream(
     parallel_config: parallel::ParallelConfig,
 ) -> Result<()> {
     info!(
-        "Starting stream-based crank with Geyser/LaserStream (state refresh every {} hours, max {} concurrent)",
+        "Starting stream-based crank with Yellowstone gRPC (state refresh every {} hours, max {} concurrent)",
         state_refresh_hours, parallel_config.max_concurrent
     );
 

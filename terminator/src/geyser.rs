@@ -1,6 +1,6 @@
-//! Geyser/LaserStream integration for real-time obligation and oracle monitoring.
+//! Yellowstone gRPC integration for real-time obligation and oracle monitoring.
 //!
-//! This module provides streaming updates from Helius LaserStream (Yellowstone gRPC)
+//! This module provides streaming updates via Yellowstone gRPC (Geyser)
 //! to detect obligation changes in real-time instead of polling.
 //! It also streams oracle price updates (Pyth, Switchboard, Scope) to avoid RPC latency.
 
@@ -22,12 +22,12 @@ use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof,
 };
 
-/// Configuration for connecting to Helius LaserStream
+/// Configuration for connecting to Yellowstone gRPC
 #[derive(Debug, Clone)]
 pub struct GeyserConfig {
-    /// LaserStream endpoint (e.g., "https://laserstream-mainnet-ewr.helius-rpc.com")
+    /// Yellowstone gRPC endpoint URL
     pub endpoint: String,
-    /// Helius API key for authentication
+    /// API key for authentication (x-token)
     pub api_key: String,
     /// Kamino lending program ID to monitor
     pub program_id: Pubkey,
@@ -337,7 +337,7 @@ async fn connect_and_stream(
     oracle_cache: &OracleCache,
     reserve_cache: &ReserveCache,
 ) -> Result<()> {
-    // Connect to Helius LaserStream using the builder pattern with timeout
+    // Connect to Yellowstone gRPC endpoint using the builder pattern with timeout
     let connect_timeout = Duration::from_secs(30);
 
     info!("Attempting to connect to Geyser endpoint...");

@@ -158,6 +158,7 @@ pub fn create_tip_instruction(payer: &Pubkey, tip_lamports: u64) -> solana_sdk::
 #[derive(Debug, serde::Deserialize)]
 struct TipFloorEntry {
     landed_tips_75th_percentile: f64,
+    landed_tips_95th_percentile: f64,
 }
 
 /// Jito bundle submission client with multi-endpoint failover
@@ -205,7 +206,9 @@ impl JitoClient {
     }
 
     /// Spawn a background task that polls the Jito tip floor API every 5 seconds
-    /// and updates `dynamic_tip_lamports` with 2× the 75th percentile tip.
+    /// and updates `dynamic_tip_lamports` with an estimated p90 tip.
+    ///
+    /// p90 is approximated via log-linear interpolation: `p75 * (p95/p75)^0.75`
     pub fn spawn_tip_floor_refresher(&'static self) -> JoinHandle<()> {
         const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
         const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -216,12 +219,20 @@ impl JitoClient {
                     Ok(resp) => match resp.json::<Vec<TipFloorEntry>>().await {
                         Ok(entries) => {
                             if let Some(entry) = entries.first() {
-                                let lamports = (entry.landed_tips_75th_percentile * 1e9 * 2.0) as u64;
+                                let p75 = entry.landed_tips_75th_percentile;
+                                let p95 = entry.landed_tips_95th_percentile;
+                                // Approximate p90 via log-linear interpolation between p75 and p95
+                                let p90 = if p75 > 0.0 {
+                                    p75 * (p95 / p75).powf(0.75)
+                                } else {
+                                    p95
+                                };
+                                let lamports = (p90 * 1e9) as u64;
                                 if lamports > 0 {
                                     self.dynamic_tip_lamports.store(lamports, Ordering::Relaxed);
                                     info!(
-                                        "Jito tip floor updated: p75={:.6} SOL, dynamic_tip={} lamports (2x), effective_tip={} lamports",
-                                        entry.landed_tips_75th_percentile,
+                                        "Jito tip floor updated: p75={:.6} p90~={:.6} p95={:.6} SOL, dynamic_tip={} lamports, effective_tip={} lamports",
+                                        p75, p90, p95,
                                         lamports,
                                         lamports.max(self.config.tip_lamports),
                                     );

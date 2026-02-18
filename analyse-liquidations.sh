@@ -25,6 +25,7 @@ trap "rm -f $CLEAN_LOG" EXIT
 
 python3 - "$CLEAN_LOG" "$RPC_URL" << 'PYEOF'
 import json
+import os
 import re
 import subprocess
 import sys
@@ -61,6 +62,16 @@ def parse_timestamp(ts_str):
         return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except:
         return None
+
+def is_error_6016(err):
+    """Check if error is Custom(6016) - obligation is healthy / position recovered."""
+    if isinstance(err, dict):
+        ie = err.get("InstructionError")
+        if isinstance(ie, list) and len(ie) >= 2:
+            custom = ie[1]
+            if isinstance(custom, dict) and custom.get("Custom") == 6016:
+                return True
+    return False
 
 def analyse_winner_tx(tx):
     """Extract strategy details from a winning transaction."""
@@ -143,6 +154,68 @@ def analyse_winner_tx(tx):
         "alts": len(alts),
     }
 
+# ─── Detect our wallet from keypair path ───
+
+our_wallet = None
+keypair_path = None
+prev_line_is_keypair = False
+
+with open(LOG_FILE) as f:
+    for line in f:
+        line = line.strip()
+        if prev_line_is_keypair:
+            m = re.search(r'"([^"]+)"', line)
+            if m:
+                keypair_path = m.group(1)
+            prev_line_is_keypair = False
+            break
+        if "keypair: Some(" in line:
+            m = re.search(r'keypair: Some\(\s*"([^"]+)"', line)
+            if m:
+                keypair_path = m.group(1)
+                break
+            else:
+                prev_line_is_keypair = True
+        # Stop scanning after startup block
+        if "LIQUIDATABLE:" in line:
+            break
+
+if keypair_path:
+    # Resolve relative to log file directory (program likely ran from parent dir)
+    log_dir = os.path.dirname(os.path.abspath(LOG_FILE))
+    candidates = [
+        os.path.join(log_dir, keypair_path),
+        os.path.abspath(keypair_path),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                result = subprocess.run(
+                    ["solana-keygen", "pubkey", path],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    our_wallet = result.stdout.strip()
+                    break
+            except FileNotFoundError:
+                # solana-keygen not installed, try reading JSON directly
+                try:
+                    with open(path) as kf:
+                        key_bytes = json.load(kf)
+                    if isinstance(key_bytes, list) and len(key_bytes) == 64:
+                        # Use nacl/ed25519 to derive pubkey if available
+                        try:
+                            from nacl.signing import SigningKey
+                            sk = SigningKey(bytes(key_bytes[:32]))
+                            import base58
+                            our_wallet = base58.b58encode(bytes(sk.verify_key)).decode()
+                        except ImportError:
+                            pass
+                except:
+                    pass
+            except:
+                pass
+
 # ─── Parse log file ───
 
 liquidations = []
@@ -173,6 +246,9 @@ with open(LOG_FILE) as f:
                 "outcome": None,
                 "total_ms": None,
                 "profit": None,
+                "tip_lamports": None,
+                "multi_hop": False,
+                "multi_hop_ms": None,
             }
             ltv_margin = (float(m.group(3)) - float(m.group(4))) / float(m.group(4)) * 100
             current["ltv_margin_pct"] = round(ltv_margin, 2)
@@ -196,13 +272,13 @@ with open(LOG_FILE) as f:
         if m:
             current["profit"] = int(m.group(1))
 
-        # Jito submitted
-        m = re.search(r"Jito bundle submitted via (https://\S+) in (\d+)ms", line)
+        # Jito submitted (with tip extraction)
+        m = re.search(r"Jito bundle submitted via (https://\S+) in (\d+)ms \(tip: (\d+) lamports\)", line)
         if m:
             current["jito_result"] = f"submitted ({m.group(1).split('//')[1].split('.')[0]})"
             current["jito_ms"] = int(m.group(2))
+            current["tip_lamports"] = int(m.group(3))
             current["outcome"] = "jito_submitted"
-            # Calculate total from detect to jito submit
             current["total_ms"] = current["queue_ms"] + (current["build_ms"] or 0) + current["jito_ms"]
 
         # Jito 429 — track separately so later outcomes don't erase it
@@ -234,6 +310,23 @@ with open(LOG_FILE) as f:
         if "not tradable" in line.lower() or "TOKEN_NOT_TRADABLE" in line:
             current["outcome"] = "not_tradable"
 
+        # Transaction too large
+        m = re.search(r"Transaction too large: (\d+) bytes", line)
+        if m:
+            current["outcome"] = "tx_too_large"
+            current["tx_size"] = int(m.group(1))
+
+        # Reserve ineligible (Max LTV = 0)
+        if "Max LTV of the withdraw reserve is 0" in line:
+            current["outcome"] = "reserve_ineligible"
+
+        # Multi-hop routing
+        m = re.search(r"Multi-hop route found(?: in (\d+)ms)?", line)
+        if m:
+            current["multi_hop"] = True
+            if m.group(1):
+                current["multi_hop_ms"] = int(m.group(1))
+
 if current:
     liquidations.append(current)
 
@@ -246,27 +339,41 @@ if not liquidations:
 print(f"\n{'='*80}")
 print(f"LIQUIDATION ANALYSIS: {len(liquidations)} attempts")
 print(f"Log: {LOG_FILE}")
+if our_wallet:
+    print(f"Our wallet: {our_wallet}")
 print(f"{'='*80}\n")
 
 winners_by_signer = {}
-results = []
+same_slot_count = 0
+winner_count = 0
+position_recovered_count = 0
+no_activity_count = 0
 
 for liq in liquidations:
     tid = liq.get("task_id", "?")
     obl_short = liq["obligation_short"]
-    print(f"--- T{tid}: {obl_short} (slot {liq['slot']}, LTV margin {liq['ltv_margin_pct']:.2f}%) ---")
+    flags = []
+    if liq.get("multi_hop"):
+        flags.append("MULTI-HOP")
+    flag_str = f" [{', '.join(flags)}]" if flags else ""
+    print(f"--- T{tid}: {obl_short} (slot {liq['slot']}, LTV margin {liq['ltv_margin_pct']:.2f}%){flag_str} ---")
 
     # Our timing
     build = liq.get("build_ms", "?")
     jito = liq.get("jito_ms")
     print(f"  Our build: {build}ms | Jito: {liq.get('jito_result', 'N/A')}", end="")
     if jito:
-        print(f" ({jito}ms)")
+        print(f" ({jito}ms)", end="")
+    if liq.get("tip_lamports") is not None:
+        tip_sol = liq["tip_lamports"] / 1_000_000_000
+        print(f" | Tip: {liq['tip_lamports']} lamports ({tip_sol:.6f} SOL)")
     else:
         print()
     outcome_str = liq['outcome'] or "unknown"
     if liq.get("jito_429") and liq["outcome"] != "jito_429":
         outcome_str += " (after Jito 429)"
+    if liq.get("tx_size"):
+        outcome_str += f" ({liq['tx_size']} bytes)"
     print(f"  Outcome: {outcome_str}")
     if liq.get("profit"):
         print(f"  Expected profit: {liq['profit']} debt tokens")
@@ -279,17 +386,20 @@ for liq in liquidations:
     print(f"  Looking up on-chain winner...")
     sigs = get_signatures(liq["obligation"])
     winner_sig = None
-    our_failed = []
 
     # Find the closest successful tx near our detection slot
     # Use a wider window (±20 slots ≈ 8-10 seconds) to catch winners
     # that landed slightly later due to Jito/leader schedule
     candidates = []
+    failed_6016 = []
     for sig_info in sigs:
         sig_slot = sig_info["slot"]
         sig_err = sig_info.get("err")
-        if sig_err is None and abs(sig_slot - liq["slot"]) <= 20:
-            candidates.append(sig_info)
+        if abs(sig_slot - liq["slot"]) <= 20:
+            if sig_err is None:
+                candidates.append(sig_info)
+            elif is_error_6016(sig_err):
+                failed_6016.append(sig_info)
 
     # Pick the closest successful tx to our detection slot
     if candidates:
@@ -302,7 +412,9 @@ for liq in liquidations:
             info = analyse_winner_tx(tx)
             if info:
                 short_signer = info["signer_short"]
-                print(f"  WINNER: {short_signer} at slot {info['slot']}")
+                is_us = our_wallet and info["signer"] == our_wallet
+                us_tag = " (US!)" if is_us else ""
+                print(f"  WINNER: {short_signer}{us_tag} at slot {info['slot']}")
                 print(f"    Strategy: {info['strategy']}")
                 print(f"    Instructions: {info['instructions']} | CU: {info['cu']} | Fee: {info['fee']} lamports")
                 print(f"    Bonus: {info['bonus_bps']}bps | Batch refresh: {info['has_batch_refresh']}")
@@ -319,18 +431,37 @@ for liq in liquidations:
                         "strategy": info["strategy"],
                         "fees": [],
                         "has_batch_refresh": info["has_batch_refresh"],
+                        "is_us": is_us,
                     }
                 winners_by_signer[signer]["wins"].append(f"T{tid}")
                 winners_by_signer[signer]["fees"].append(info["fee"])
 
-                same_slot = "YES" if info["slot"] == liq["slot"] else f"NO (winner slot {info['slot']})"
+                is_same_slot = info["slot"] == liq["slot"]
+                same_slot = "YES" if is_same_slot else f"NO (winner slot {info['slot']}, delta={info['slot'] - liq['slot']})"
                 print(f"    Same slot as detection: {same_slot}")
 
                 liq["winner"] = info
+                winner_count += 1
+                if is_same_slot:
+                    same_slot_count += 1
         else:
             print(f"  Winner TX found but couldn't fetch details")
     else:
-        print(f"  No winning liquidation found near slot {liq['slot']}")
+        # No successful tx found — classify why
+        if failed_6016:
+            liq["winner_status"] = "position_recovered"
+            position_recovered_count += 1
+            print(f"  Position recovered (no winner) — {len(failed_6016)} attempt(s) failed with 6016 (obligation healthy)")
+        else:
+            # Check if there were any txs at all near this slot
+            any_nearby = [s for s in sigs if abs(s["slot"] - liq["slot"]) <= 20]
+            if any_nearby:
+                liq["winner_status"] = "no_winner"
+                print(f"  No winning liquidation found near slot {liq['slot']} ({len(any_nearby)} txs, all failed)")
+            else:
+                liq["winner_status"] = "no_activity"
+                no_activity_count += 1
+                print(f"  No activity near slot {liq['slot']}")
 
     print()
 
@@ -354,10 +485,25 @@ outcome_labels = {
     "no_swap_route": "No swap route available",
     "not_tradable": "Collateral not tradable",
     "rpc_sent": "Sent via RPC fallback",
+    "tx_too_large": "Transaction too large (multi-hop overflow)",
+    "reserve_ineligible": "Reserve ineligible (Max LTV = 0)",
 }
 for outcome, count in sorted(outcomes.items(), key=lambda x: -x[1]):
     label = outcome_labels.get(outcome, outcome)
     print(f"  {count}x {label}")
+
+# On-chain results
+if winner_count > 0 or position_recovered_count > 0 or no_activity_count > 0:
+    print(f"\nOn-chain results:")
+    print(f"  {winner_count} won by someone (competitor or us)")
+    if position_recovered_count:
+        print(f"  {position_recovered_count} position recovered (no winner)")
+    if no_activity_count:
+        print(f"  {no_activity_count} no on-chain activity")
+
+# Same-slot ratio
+if winner_count > 0:
+    print(f"\nSame-slot winners: {same_slot_count}/{winner_count} landed in detection slot")
 
 # Competitor analysis
 if winners_by_signer:
@@ -368,7 +514,10 @@ if winners_by_signer:
         avg_fee = sum(info["fees"]) // len(info["fees"])
         wins = ", ".join(info["wins"])
         batch = "Yes" if info["has_batch_refresh"] else "No"
-        print(f"  {info['short']:<12} {wins:<15} {info['strategy']:<35} {avg_fee:<12} {batch}")
+        label = info["short"]
+        if info.get("is_us"):
+            label += " (us)"
+        print(f"  {label:<12} {wins:<15} {info['strategy']:<35} {avg_fee:<12} {batch}")
 
 # Timing analysis
 build_times = [l["build_ms"] for l in liquidations if l.get("build_ms") is not None]
@@ -379,9 +528,31 @@ jito_submitted = [l for l in liquidations if l["outcome"] == "jito_submitted"]
 jito_429 = [l for l in liquidations if l.get("jito_429")]
 print(f"Jito: {len(jito_submitted)} submitted, {len(jito_429)} rate limited (429)")
 
+# Tip stats
+tips = [l["tip_lamports"] for l in liquidations if l.get("tip_lamports") is not None]
+if tips:
+    avg_tip = sum(tips) // len(tips)
+    print(f"Tips: min={min(tips)} avg={avg_tip} max={max(tips)} lamports "
+          f"({min(tips)/1e9:.6f} / {avg_tip/1e9:.6f} / {max(tips)/1e9:.6f} SOL)")
+
+# Multi-hop stats
+multi_hop_attempts = [l for l in liquidations if l.get("multi_hop")]
+if multi_hop_attempts:
+    tids = ", ".join(f"T{l.get('task_id','?')}" for l in multi_hop_attempts)
+    print(f"Multi-hop routing: {len(multi_hop_attempts)} attempts ({tids})")
+
+# Value at risk (expected profit from attempts where we didn't win)
+missed_profits = [l["profit"] for l in liquidations
+                  if l.get("profit") and not (l.get("winner") and our_wallet and l["winner"]["signer"] == our_wallet)]
+if missed_profits:
+    print(f"\nValue at risk: {sum(missed_profits)} debt tokens total from {len(missed_profits)} attempts")
+
 # Wins vs losses
-wins = [l for l in liquidations if l.get("winner") and l["winner"]["signer"] == "TODO_OUR_WALLET"]
-print(f"\nResult: 0 wins / {len(liquidations)} attempts")  # TODO: detect our wallet
+our_wins = [l for l in liquidations if l.get("winner") and our_wallet and l["winner"]["signer"] == our_wallet]
+if our_wallet:
+    print(f"\nResult: {len(our_wins)} wins / {len(liquidations)} attempts (wallet: {our_wallet[:8]}...)")
+else:
+    print(f"\nResult: ? wins / {len(liquidations)} attempts (wallet not detected — install solana-keygen or check keypair path)")
 
 print()
 PYEOF

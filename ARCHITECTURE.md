@@ -98,9 +98,11 @@ Per-market ALTs created/extended at startup only, cached in memory:
 
 Liquidations execute sequentially on the main thread because the Kamino lending library uses `Rc<RefCell<>>` internally (`!Send`). The orchestrator still prevents duplicate attempts on the same obligation.
 
-### 6. Jito Submission
+### 6. Jito Submission (`jito.rs`)
 
-Transactions are wrapped in Jito bundles (tip + liquidation tx) and submitted to 4 EU endpoints in parallel via `select_ok` — first successful response wins.
+Transactions are wrapped in Jito bundles (tip + liquidation tx) and submitted to 4 EU endpoints in parallel via `select_ok` — first successful response wins. Requires `JITO_AUTH_UUID` (whitelisted UUID sent as `x-jito-auth` header).
+
+**Dynamic tips**: A background task polls the Jito tip floor API every 5s and sets the tip to an estimated p90 of recently landed tips, interpolated from p75 and p95 via `p75 * (p95/p75)^0.75`. The tip is clamped between the configured minimum (`JITO_TIP_LAMPORTS`, default 10,000) and a hard cap of 0.01 SOL.
 
 ## Transaction Size Constraints
 
@@ -123,6 +125,7 @@ Speed is critical — positions can become healthy again within seconds. The bot
 - **OracleCache**: Real-time oracle prices streamed via Geyser
 - **ReserveCache**: Real-time reserve data streamed via Geyser
 - **BlockhashCache**: Background task refreshes every 2s via `tokio::sync::watch` channel
+- **Jito tip floor**: Background task polls tip floor API every 5s, stores estimated p90 in `AtomicU64`
 - **Lookup tables**: Loaded once at startup, cached in memory
 
 ### Fast Liquidation Path (`liquidate_fast`)

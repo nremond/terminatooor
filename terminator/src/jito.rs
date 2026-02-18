@@ -78,6 +78,8 @@ pub struct JitoConfig {
     pub tip_lamports: u64,
     /// Whether Jito is enabled
     pub enabled: bool,
+    /// Whitelisted auth UUID for higher rate limits (sent as x-jito-auth header)
+    pub auth_uuid: Option<String>,
 }
 
 impl Default for JitoConfig {
@@ -87,6 +89,7 @@ impl Default for JitoConfig {
             endpoint_type: JitoEndpointType::BlockEngine,
             tip_lamports: 10_000, // 0.00001 SOL default tip
             enabled: false,
+            auth_uuid: None,
         }
     }
 }
@@ -95,7 +98,7 @@ impl JitoConfig {
     /// Load configuration from environment variables
     ///
     /// Environment variables:
-    /// - JITO_ENABLED: "true" or "1" to enable Jito bundles
+    /// - JITO_AUTH_UUID: Whitelisted UUID (required to enable Jito bundles)
     /// - JITO_ENDPOINT_URL: Primary URL for bundle submission (optional for BlockEngine)
     /// - JITO_ENDPOINT_TYPE: "triton" for Triton RPC, "block_engine" for direct Jito (default)
     /// - JITO_TIP_LAMPORTS: Tip amount in lamports (default: 10_000)
@@ -109,9 +112,8 @@ impl JitoConfig {
     ///   JITO_ENDPOINT_TYPE=triton
     ///   Note: Requires your IP to be whitelisted with Jito Block Engine
     pub fn from_env() -> Self {
-        let enabled = std::env::var("JITO_ENABLED")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        let auth_uuid = std::env::var("JITO_AUTH_UUID").ok().filter(|v| !v.is_empty());
+        let enabled = auth_uuid.is_some();
 
         let endpoint_url = std::env::var("JITO_ENDPOINT_URL")
             .or_else(|_| std::env::var("JITO_BLOCK_ENGINE_URL")) // backwards compatibility
@@ -134,6 +136,7 @@ impl JitoConfig {
             endpoint_type,
             tip_lamports,
             enabled,
+            auth_uuid,
         }
     }
 }
@@ -169,10 +172,18 @@ pub struct JitoClient {
 
 impl JitoClient {
     pub fn new(config: JitoConfig) -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+
+        if let Some(ref uuid) = config.auth_uuid {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::HeaderName::from_static("x-jito-auth"),
+                reqwest::header::HeaderValue::from_str(uuid).expect("invalid JITO_AUTH_UUID value"),
+            );
+            builder = builder.default_headers(headers);
+        }
+
+        let http_client = builder.build().unwrap();
 
         Self {
             config,
@@ -587,6 +598,7 @@ mod tests {
             endpoint_type: JitoEndpointType::BlockEngine,
             tip_lamports: 10_000,
             enabled: true,
+            auth_uuid: None,
         };
         let client = JitoClient::new(config);
 

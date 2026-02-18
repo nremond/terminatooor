@@ -39,7 +39,10 @@ lazy_static::lazy_static! {
     static ref JITO_CLIENT: JitoClient = {
         let config = JitoConfig::from_env();
         if config.enabled {
-            info!("Jito bundle submission enabled (tip: {} lamports)", config.tip_lamports);
+            info!("Jito bundle submission enabled (tip: {} lamports, auth: {})",
+                config.tip_lamports,
+                if config.auth_uuid.is_some() { "whitelisted" } else { "none" },
+            );
         }
         JitoClient::new(config)
     };
@@ -288,7 +291,7 @@ async fn test_jito_connection(klend_client: &Arc<KlendClient>) -> Result<()> {
     info!("=== Testing Jito Bundle Submission ===");
 
     if !JITO_CLIENT.is_enabled() {
-        error!("Jito is not enabled. Set JITO_ENABLED=true");
+        error!("Jito is not enabled. Set JITO_AUTH_UUID to enable");
         return Err(anyhow::anyhow!("Jito not enabled"));
     }
 

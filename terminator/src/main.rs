@@ -1656,6 +1656,13 @@ async fn crank_stream(
     let swap_alt_cache = SwapAltCache::new();
     swap_alt_cache.prewarm(&klend_client.client.client).await;
 
+    // Spawn Jito tip floor refresher (polls API to set dynamic tip)
+    let _tip_floor_task = if JITO_CLIENT.is_enabled() {
+        Some(JITO_CLIENT.spawn_tip_floor_refresher())
+    } else {
+        None
+    };
+
     // Track obligations we've seen and their LTVs
     let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
     let mut last_state_refresh = std::time::Instant::now();

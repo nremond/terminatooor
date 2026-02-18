@@ -10,7 +10,7 @@
 //! - Triton RPC pass-through: Your Triton RPC endpoint with Jito support enabled
 //!   (requires IP whitelisting with Jito Block Engine)
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +25,7 @@ use solana_sdk::{
     system_instruction,
     transaction::VersionedTransaction,
 };
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 /// Jito tip accounts - one is randomly selected per bundle
@@ -150,12 +151,20 @@ pub fn create_tip_instruction(payer: &Pubkey, tip_lamports: u64) -> solana_sdk::
     system_instruction::transfer(payer, &tip_account, tip_lamports)
 }
 
+/// Response from Jito tip floor API
+#[derive(Debug, serde::Deserialize)]
+struct TipFloorEntry {
+    landed_tips_75th_percentile: f64,
+}
+
 /// Jito bundle submission client with multi-endpoint failover
 pub struct JitoClient {
     config: JitoConfig,
     http_client: reqwest::Client,
     /// Index of last successful endpoint (for BlockEngine mode)
     last_successful_endpoint: AtomicUsize,
+    /// Dynamic tip from Jito tip floor API (in lamports)
+    dynamic_tip_lamports: AtomicU64,
 }
 
 impl JitoClient {
@@ -169,6 +178,7 @@ impl JitoClient {
             config,
             http_client,
             last_successful_endpoint: AtomicUsize::new(0),
+            dynamic_tip_lamports: AtomicU64::new(0),
         }
     }
 
@@ -177,9 +187,44 @@ impl JitoClient {
         self.config.enabled
     }
 
-    /// Get the configured tip amount
+    /// Get the tip amount (max of dynamic tip from API and configured minimum)
     pub fn tip_lamports(&self) -> u64 {
-        self.config.tip_lamports
+        let dynamic = self.dynamic_tip_lamports.load(Ordering::Relaxed);
+        dynamic.max(self.config.tip_lamports)
+    }
+
+    /// Spawn a background task that polls the Jito tip floor API every 5 seconds
+    /// and updates `dynamic_tip_lamports` with 2× the 75th percentile tip.
+    pub fn spawn_tip_floor_refresher(&'static self) -> JoinHandle<()> {
+        const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+        tokio::spawn(async move {
+            loop {
+                match self.http_client.get(TIP_FLOOR_URL).send().await {
+                    Ok(resp) => match resp.json::<Vec<TipFloorEntry>>().await {
+                        Ok(entries) => {
+                            if let Some(entry) = entries.first() {
+                                let lamports = (entry.landed_tips_75th_percentile * 1e9 * 2.0) as u64;
+                                if lamports > 0 {
+                                    self.dynamic_tip_lamports.store(lamports, Ordering::Relaxed);
+                                    info!(
+                                        "Jito tip floor updated: p75={:.6} SOL, dynamic_tip={} lamports (2x), effective_tip={} lamports",
+                                        entry.landed_tips_75th_percentile,
+                                        lamports,
+                                        lamports.max(self.config.tip_lamports),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => warn!("Failed to parse Jito tip floor response: {}", e),
+                    },
+                    Err(e) => warn!("Failed to fetch Jito tip floor: {}", e),
+                }
+
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        })
     }
 
     /// Get the bundle URL for a given endpoint base URL

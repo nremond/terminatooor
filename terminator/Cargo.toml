@@ -75,4 +75,8 @@ rand = "0.8"
 yellowstone-grpc-client = "1.13.0"
 yellowstone-grpc-proto = "1.12.0"
 tonic = "0.10"
+prost = "0.12"
 backoff = { version = "0.4", features = ["tokio"] }
+
+# ShredStream (Jito shred proxy) dependencies
+tokio-stream = "0.1"

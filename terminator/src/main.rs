@@ -66,6 +66,8 @@ mod model;
 pub mod operations;
 pub mod sysvars;
 pub mod parallel;
+pub mod shredstream;
+mod shredstream_proto;
 
 const USDC_MINT_STR: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -1665,6 +1667,42 @@ async fn crank_stream(
         None
     };
 
+    // --- ShredStream: same-block liquidation via Jito shreds ---
+    let shredstream_config = shredstream::ShredstreamConfig::from_env();
+    let watchlist = shredstream::NearThresholdWatchlist::new(shredstream_config.ltv_threshold_pct);
+    let (shred_tx, mut shred_rx) = tokio::sync::mpsc::channel::<shredstream::ShredstreamTrigger>(100);
+
+    let _shredstream_task = if shredstream_config.enabled {
+        info!(
+            "ShredStream enabled: {} (LTV threshold: {:.0}%)",
+            shredstream_config.grpc_url, shredstream_config.ltv_threshold_pct
+        );
+        // Collect oracle accounts set for ShredStream to monitor
+        let mut shred_oracle_accounts: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+        for state in market_states.values() {
+            shred_oracle_accounts.extend(state.pyth_accounts.keys());
+            shred_oracle_accounts.extend(state.switchboard_accounts.keys());
+            shred_oracle_accounts.extend(state.scope_accounts.keys());
+        }
+        info!("ShredStream monitoring {} oracle accounts", shred_oracle_accounts.len());
+
+        let shred_config = shredstream_config.clone();
+        let shred_watchlist = watchlist.clone();
+        let shred_tx_clone = shred_tx.clone();
+        Some(tokio::spawn(async move {
+            shredstream::run_shredstream(
+                shred_config,
+                shred_watchlist,
+                shred_oracle_accounts,
+                shred_tx_clone,
+            )
+            .await;
+        }))
+    } else {
+        info!("ShredStream disabled (SHREDSTREAM_GRPC_URL not set)");
+        None
+    };
+
     // Track obligations we've seen and their LTVs
     let mut obligation_ltvs: HashMap<Pubkey, Fraction> = HashMap::new();
     let mut last_state_refresh = std::time::Instant::now();
@@ -1723,170 +1761,255 @@ async fn crank_stream(
             last_state_refresh = std::time::Instant::now();
         }
 
-        // Process obligation updates from Geyser
-        // Use a timeout so we can do periodic tasks
-        let update = tokio::time::timeout(
-            Duration::from_secs(5),
-            geyser_stream.recv()
-        ).await;
+        // Process events from Geyser and ShredStream using select!
+        tokio::select! {
+            // Branch 1: Geyser obligation update (existing path)
+            update = geyser_stream.recv() => {
+                match update {
+                    Some(obligation_update) => {
+                        let start = std::time::Instant::now();
 
-        match update {
-            Ok(Some(obligation_update)) => {
-                let start = std::time::Instant::now();
+                        // Try to deserialize the obligation
+                        if let Some(obligation) = deserialize_obligation(&obligation_update.data) {
+                            // Find which market this obligation belongs to
+                            let market_pubkey = obligation.lending_market;
 
-                // Try to deserialize the obligation
-                if let Some(obligation) = deserialize_obligation(&obligation_update.data) {
-                    // Find which market this obligation belongs to
-                    let market_pubkey = obligation.lending_market;
+                            // Check if we're monitoring this market
+                            if !lending_markets.contains(&market_pubkey) {
+                                continue;
+                            }
 
-                    // Check if we're monitoring this market
-                    if !lending_markets.contains(&market_pubkey) {
-                        continue;
-                    }
+                            // Get the market state
+                            let market_state = match market_states.get(&market_pubkey) {
+                                Some(state) => state,
+                                None => {
+                                    warn!("No market state for {}, skipping", market_pubkey);
+                                    continue;
+                                }
+                            };
 
-                    // Get the market state
-                    let market_state = match market_states.get(&market_pubkey) {
-                        Some(state) => state,
-                        None => {
-                            warn!("No market state for {}, skipping", market_pubkey);
-                            continue;
-                        }
-                    };
+                            // Evaluate the obligation
+                            match evaluate_obligation_streaming(
+                                &klend_client,
+                                &obligation_update.pubkey,
+                                &obligation,
+                                market_state,
+                            ).await {
+                                Ok(Some(ltv_info)) => {
+                                    let prev_ltv = obligation_ltvs.get(&obligation_update.pubkey);
+                                    let ltv_changed = prev_ltv.map(|p| *p != ltv_info.ltv).unwrap_or(true);
+                                    obligation_ltvs.insert(obligation_update.pubkey, ltv_info.ltv);
 
-                    // Evaluate the obligation
-                    match evaluate_obligation_streaming(
-                        &klend_client,
-                        &obligation_update.pubkey,
-                        &obligation,
-                        market_state,
-                    ).await {
-                        Ok(Some(ltv_info)) => {
-                            let prev_ltv = obligation_ltvs.get(&obligation_update.pubkey);
-                            let ltv_changed = prev_ltv.map(|p| *p != ltv_info.ltv).unwrap_or(true);
-                            obligation_ltvs.insert(obligation_update.pubkey, ltv_info.ltv);
+                                    // Update ShredStream watchlist with current LTV data
+                                    if shredstream_config.enabled {
+                                        let ltv_f64: f64 = ltv_info.ltv.to_num();
+                                        let unhealthy_f64: f64 = ltv_info.unhealthy_ltv.to_num();
+                                        watchlist.update(
+                                            &obligation_update.pubkey,
+                                            &obligation,
+                                            &market_pubkey,
+                                            ltv_f64,
+                                            unhealthy_f64,
+                                            &market_state.reserves,
+                                        );
+                                    }
 
-                            if ltv_info.is_liquidatable {
-                                let queue_latency = obligation_update.received_at.elapsed();
-                                info!(
-                                    "{} LIQUIDATABLE: {} LTV={:?} (unhealthy={:?}) slot={} queue={}ms eval={}ms",
-                                    "!!!".red().bold(),
-                                    obligation_update.pubkey.to_string().red(),
-                                    ltv_info.ltv,
-                                    ltv_info.unhealthy_ltv,
-                                    obligation_update.slot,
-                                    queue_latency.as_millis(),
-                                    start.elapsed().as_millis()
-                                );
+                                    if ltv_info.is_liquidatable {
+                                        let queue_latency = obligation_update.received_at.elapsed();
+                                        info!(
+                                            "{} LIQUIDATABLE: {} LTV={:?} (unhealthy={:?}) slot={} queue={}ms eval={}ms",
+                                            "!!!".red().bold(),
+                                            obligation_update.pubkey.to_string().red(),
+                                            ltv_info.ltv,
+                                            ltv_info.unhealthy_ltv,
+                                            obligation_update.slot,
+                                            queue_latency.as_millis(),
+                                            start.elapsed().as_millis()
+                                        );
 
-                                // Calculate LTV margin (how far over threshold)
-                                let ltv_margin_pct = if ltv_info.unhealthy_ltv > Fraction::ZERO {
-                                    let ltv_f64: f64 = ltv_info.ltv.to_num();
-                                    let unhealthy_f64: f64 = ltv_info.unhealthy_ltv.to_num();
-                                    (ltv_f64 - unhealthy_f64) / unhealthy_f64
-                                } else {
-                                    0.0
-                                };
+                                        // Calculate LTV margin (how far over threshold)
+                                        let ltv_margin_pct = if ltv_info.unhealthy_ltv > Fraction::ZERO {
+                                            let ltv_f64: f64 = ltv_info.ltv.to_num();
+                                            let unhealthy_f64: f64 = ltv_info.unhealthy_ltv.to_num();
+                                            (ltv_f64 - unhealthy_f64) / unhealthy_f64
+                                        } else {
+                                            0.0
+                                        };
 
-                                // Trigger liquidation with orchestrator for deduplication/cooldown tracking
-                                // Note: true parallelism not possible due to Kamino library using Rc<RefCell>
-                                // but we get: deduplication, cooldown tracking, and structured logging
-                                let obligation_key = obligation_update.pubkey;
-                                let slot = obligation_update.slot;
-                                let short_id = &obligation_key.to_string()[..8];
+                                        // Trigger liquidation with orchestrator for deduplication/cooldown tracking
+                                        let obligation_key = obligation_update.pubkey;
+                                        let slot = obligation_update.slot;
+                                        let short_id = &obligation_key.to_string()[..8];
 
-                                // Check orchestrator for deduplication
-                                match orchestrator.try_start(&obligation_key).await {
-                                    Some((task_id, permit)) => {
-                                        let prefix = format!("[T{}:{}]", task_id, short_id);
-                                        info!("{} Starting liquidation (LTV margin={:.2}%)", prefix, ltv_margin_pct * 100.0);
+                                        // Check orchestrator for deduplication
+                                        match orchestrator.try_start(&obligation_key).await {
+                                            Some((task_id, permit)) => {
+                                                let prefix = format!("[T{}:{}]", task_id, short_id);
+                                                info!("{} Starting liquidation (LTV margin={:.2}%)", prefix, ltv_margin_pct * 100.0);
 
-                                        // Wrap with catch_unwind to handle panics from klend library
-                                        let liquidation_result = AssertUnwindSafe(liquidate_fast(
-                                            &klend_client,
-                                            &obligation_key,
-                                            obligation.clone(),
-                                            market_state,
-                                            slot,
-                                            ltv_margin_pct,
-                                            &prefix,
-                                            geyser_stream.oracle_cache(),
-                                            geyser_stream.reserve_cache(),
-                                            &swap_alt_cache,
-                                        )).catch_unwind().await;
+                                                // Wrap with catch_unwind to handle panics from klend library
+                                                let liquidation_result = AssertUnwindSafe(liquidate_fast(
+                                                    &klend_client,
+                                                    &obligation_key,
+                                                    obligation.clone(),
+                                                    market_state,
+                                                    slot,
+                                                    ltv_margin_pct,
+                                                    &prefix,
+                                                    geyser_stream.oracle_cache(),
+                                                    geyser_stream.reserve_cache(),
+                                                    &swap_alt_cache,
+                                                )).catch_unwind().await;
 
-                                        match liquidation_result {
-                                            Ok(Ok(())) => {
-                                                // Note: Ok(()) means the attempt finished without error,
-                                                // but the liquidation may have been skipped (e.g., obligation became healthy)
-                                                // The actual outcome is logged by liquidate_fast itself
-                                                debug!("{} Attempt finished", prefix);
-                                            }
-                                            Ok(Err(e)) => {
-                                                let err_str = format!("{:?}", e);
-                                                let classification = parallel::classify_error(&err_str);
-                                                match classification {
-                                                    parallel::ErrorClassification::Permanent(reason) => {
-                                                        info!("{} ✗ Permanent error ({})", prefix, reason);
+                                                match liquidation_result {
+                                                    Ok(Ok(())) => {
+                                                        debug!("{} Attempt finished", prefix);
                                                     }
-                                                    parallel::ErrorClassification::Retryable(reason) => {
-                                                        warn!("{} ⟳ Retryable error ({})", prefix, reason);
+                                                    Ok(Err(e)) => {
+                                                        let err_str = format!("{:?}", e);
+                                                        let classification = parallel::classify_error(&err_str);
+                                                        match classification {
+                                                            parallel::ErrorClassification::Permanent(reason) => {
+                                                                info!("{} ✗ Permanent error ({})", prefix, reason);
+                                                            }
+                                                            parallel::ErrorClassification::Retryable(reason) => {
+                                                                warn!("{} ⟳ Retryable error ({})", prefix, reason);
+                                                            }
+                                                            parallel::ErrorClassification::Unknown => {
+                                                                warn!("{} ? Error: {}", prefix, &err_str[..100.min(err_str.len())]);
+                                                            }
+                                                        }
                                                     }
-                                                    parallel::ErrorClassification::Unknown => {
-                                                        warn!("{} ? Error: {}", prefix, &err_str[..100.min(err_str.len())]);
+                                                    Err(panic_info) => {
+                                                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                                            s.to_string()
+                                                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                                            s.clone()
+                                                        } else {
+                                                            "Unknown panic".to_string()
+                                                        };
+                                                        warn!("{} ⚠ Panic: {}", prefix, panic_msg);
                                                     }
                                                 }
+
+                                                // Release orchestrator slot (cooldown starts)
+                                                orchestrator.finish(&obligation_key).await;
+                                                drop(permit);
                                             }
-                                            Err(panic_info) => {
-                                                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                                                    s.to_string()
-                                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                                                    s.clone()
-                                                } else {
-                                                    "Unknown panic".to_string()
-                                                };
-                                                warn!("{} ⚠ Panic: {}", prefix, panic_msg);
+                                            None => {
+                                                // Blocked by dedup or rate limit
+                                                info!("[SKIP] {} already in-flight or cooldown", short_id);
                                             }
                                         }
-
-                                        // Release orchestrator slot (cooldown starts)
-                                        orchestrator.finish(&obligation_key).await;
-                                        drop(permit);
-                                    }
-                                    None => {
-                                        // Blocked by dedup or rate limit
-                                        info!("[SKIP] {} already in-flight or cooldown", short_id);
+                                    } else if ltv_changed && ltv_info.ltv > Fraction::ZERO {
+                                        // Log obligations with non-zero LTV for awareness
+                                        info!(
+                                            "Obligation {} LTV={:?} (unhealthy={:?}) slot={} latency={}ms",
+                                            obligation_update.pubkey.to_string().yellow(),
+                                            ltv_info.ltv,
+                                            ltv_info.unhealthy_ltv,
+                                            obligation_update.slot,
+                                            start.elapsed().as_millis()
+                                        );
                                     }
                                 }
-                            } else if ltv_changed && ltv_info.ltv > Fraction::ZERO {
-                                // Log obligations with non-zero LTV for awareness
-                                info!(
-                                    "Obligation {} LTV={:?} (unhealthy={:?}) slot={} latency={}ms",
-                                    obligation_update.pubkey.to_string().yellow(),
-                                    ltv_info.ltv,
-                                    ltv_info.unhealthy_ltv,
-                                    obligation_update.slot,
-                                    start.elapsed().as_millis()
-                                );
+                                Ok(None) => {
+                                    // Zero debt obligation, skip
+                                }
+                                Err(e) => {
+                                    warn!("Failed to evaluate obligation {}: {:?}", obligation_update.pubkey, e);
+                                }
                             }
                         }
-                        Ok(None) => {
-                            // Zero debt obligation, skip
-                        }
-                        Err(e) => {
-                            warn!("Failed to evaluate obligation {}: {:?}", obligation_update.pubkey, e);
-                        }
+                    }
+                    None => {
+                        // Stream closed, this shouldn't happen with reconnection logic
+                        warn!("Geyser stream closed unexpectedly");
+                        return Err(anyhow::anyhow!("Geyser stream closed"));
                     }
                 }
             }
-            Ok(None) => {
-                // Stream closed, this shouldn't happen with reconnection logic
-                warn!("Geyser stream closed unexpectedly");
-                return Err(anyhow::anyhow!("Geyser stream closed"));
+
+            // Branch 2: ShredStream oracle trigger (new fast path)
+            Some(trigger) = shred_rx.recv() => {
+                info!(
+                    "ShredStream trigger: oracle update for obligation {} (slot {}, LTV={:.1}%)",
+                    trigger.obligation_pubkey, trigger.source_slot, trigger.ltv_pct
+                );
+
+                let obligation_key = trigger.obligation_pubkey;
+                let short_id = &obligation_key.to_string()[..8];
+
+                // Get the market state for this obligation
+                let market_state = match market_states.get(&trigger.market_pubkey) {
+                    Some(state) => state,
+                    None => {
+                        warn!("ShredStream: no market state for {}, skipping", trigger.market_pubkey);
+                        continue;
+                    }
+                };
+
+                // Dedup via orchestrator (prevents both ShredStream and Geyser from double-liquidating)
+                match orchestrator.try_start(&obligation_key).await {
+                    Some((task_id, permit)) => {
+                        let prefix = format!("[S{}:{}]", task_id, short_id);
+                        info!("{} ShredStream-triggered liquidation (LTV={:.1}%)", prefix, trigger.ltv_pct);
+
+                        let liquidation_result = AssertUnwindSafe(liquidate_fast(
+                            &klend_client,
+                            &obligation_key,
+                            trigger.obligation,
+                            market_state,
+                            trigger.source_slot,
+                            0.0, // LTV margin not precisely known from watchlist
+                            &prefix,
+                            geyser_stream.oracle_cache(),
+                            geyser_stream.reserve_cache(),
+                            &swap_alt_cache,
+                        )).catch_unwind().await;
+
+                        match liquidation_result {
+                            Ok(Ok(())) => {
+                                debug!("{} ShredStream attempt finished", prefix);
+                            }
+                            Ok(Err(e)) => {
+                                let err_str = format!("{:?}", e);
+                                let classification = parallel::classify_error(&err_str);
+                                match classification {
+                                    parallel::ErrorClassification::Permanent(reason) => {
+                                        info!("{} ✗ Permanent error ({})", prefix, reason);
+                                    }
+                                    parallel::ErrorClassification::Retryable(reason) => {
+                                        warn!("{} ⟳ Retryable error ({})", prefix, reason);
+                                    }
+                                    parallel::ErrorClassification::Unknown => {
+                                        warn!("{} ? Error: {}", prefix, &err_str[..100.min(err_str.len())]);
+                                    }
+                                }
+                            }
+                            Err(panic_info) => {
+                                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "Unknown panic".to_string()
+                                };
+                                warn!("{} ⚠ Panic: {}", prefix, panic_msg);
+                            }
+                        }
+
+                        orchestrator.finish(&obligation_key).await;
+                        drop(permit);
+                    }
+                    None => {
+                        info!("[SKIP] ShredStream {} already in-flight or cooldown", short_id);
+                    }
+                }
             }
-            Err(_) => {
-                // Timeout, continue to allow periodic tasks
-                continue;
-            }
+
+            // Branch 3: Timeout for periodic tasks
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
     }
 }

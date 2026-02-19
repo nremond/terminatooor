@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anchor_lang::prelude::Pubkey;
 use anchor_lang::AccountDeserialize;
@@ -19,8 +19,187 @@ use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::geyser::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-    subscribe_update::UpdateOneof,
+    SubscribeRequestFilterSlots, subscribe_update::UpdateOneof,
 };
+
+/// Type of account update received from Geyser, used for per-type counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccountType {
+    Oracle,
+    Reserve,
+    Obligation,
+}
+
+/// When a slot notification arrived and whether we've already sampled its first account delta.
+struct SlotTiming {
+    received_at: Instant,
+    first_account_seen: bool,
+}
+
+/// Running min/max/sum/count for a latency window (milliseconds).
+struct LatencyStats {
+    min_ms: f64,
+    max_ms: f64,
+    sum_ms: f64,
+    count: u64,
+}
+
+impl LatencyStats {
+    fn new() -> Self {
+        Self {
+            min_ms: f64::MAX,
+            max_ms: 0.0,
+            sum_ms: 0.0,
+            count: 0,
+        }
+    }
+
+    fn record(&mut self, ms: f64) {
+        if ms < self.min_ms {
+            self.min_ms = ms;
+        }
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+        self.sum_ms += ms;
+        self.count += 1;
+    }
+
+    fn avg_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_ms / self.count as f64
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Inner state of the latency tracker, protected by `RwLock`.
+struct SlotLatencyTrackerInner {
+    /// When each slot notification arrived (pruned periodically).
+    slot_timings: HashMap<u64, SlotTiming>,
+    /// Highest slot we've seen from Geyser.
+    highest_geyser_slot: u64,
+    /// Running latency stats for the current logging window.
+    slot_to_account_stats: LatencyStats,
+    /// Per-account-type update counts for the current window.
+    per_type_counts: HashMap<AccountType, u64>,
+    /// Last time we logged a summary.
+    last_summary: Instant,
+}
+
+/// Measures the delay between Geyser slot notifications and the first account update for that
+/// slot. Thread-safe; cloneable via inner `Arc`.
+#[derive(Clone)]
+pub struct SlotLatencyTracker {
+    inner: Arc<RwLock<SlotLatencyTrackerInner>>,
+}
+
+impl SlotLatencyTracker {
+    const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+    /// Prune slot timings older than this to avoid unbounded memory growth.
+    const MAX_SLOT_AGE: Duration = Duration::from_secs(120);
+
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(SlotLatencyTrackerInner {
+                slot_timings: HashMap::new(),
+                highest_geyser_slot: 0,
+                slot_to_account_stats: LatencyStats::new(),
+                per_type_counts: HashMap::new(),
+                last_summary: Instant::now(),
+            })),
+        }
+    }
+
+    /// Record arrival of a Slot(Processed) notification.
+    pub fn record_slot(&self, slot: u64) {
+        let mut inner = self.inner.write().unwrap();
+        if slot > inner.highest_geyser_slot {
+            inner.highest_geyser_slot = slot;
+        }
+        inner.slot_timings.entry(slot).or_insert(SlotTiming {
+            received_at: Instant::now(),
+            first_account_seen: false,
+        });
+    }
+
+    /// Record arrival of an account update for a given slot and type.
+    /// If this is the first account update after the slot notification, record the delta.
+    pub fn record_account_update(&self, slot: u64, account_type: AccountType) {
+        let now = Instant::now();
+        let mut inner = self.inner.write().unwrap();
+
+        *inner.per_type_counts.entry(account_type).or_insert(0) += 1;
+
+        if let Some(timing) = inner.slot_timings.get_mut(&slot) {
+            if !timing.first_account_seen {
+                timing.first_account_seen = true;
+                let delta_ms = now.duration_since(timing.received_at).as_secs_f64() * 1000.0;
+                inner.slot_to_account_stats.record(delta_ms);
+            }
+        }
+        // If the slot hasn't been seen yet (account arrived before slot notification), we just
+        // skip the delta sample — no panic.
+    }
+
+    /// Return the highest slot seen from Geyser.
+    pub fn highest_slot(&self) -> u64 {
+        self.inner.read().unwrap().highest_geyser_slot
+    }
+
+    /// Log a summary if the interval has elapsed, then reset the window.
+    pub fn maybe_log_summary(&self) {
+        let mut inner = self.inner.write().unwrap();
+        if inner.last_summary.elapsed() < Self::SUMMARY_INTERVAL {
+            return;
+        }
+
+        let stats = &inner.slot_to_account_stats;
+        let oracle = inner.per_type_counts.get(&AccountType::Oracle).copied().unwrap_or(0);
+        let reserve = inner.per_type_counts.get(&AccountType::Reserve).copied().unwrap_or(0);
+        let obligation = inner.per_type_counts.get(&AccountType::Obligation).copied().unwrap_or(0);
+
+        if stats.count > 0 {
+            info!(
+                "Geyser latency: slot→account avg={:.1}ms min={:.1}ms max={:.1}ms samples={} | \
+                 updates: oracle={} reserve={} obligation={} | highest_slot={} slot_map_size={}",
+                stats.avg_ms(),
+                stats.min_ms,
+                stats.max_ms,
+                stats.count,
+                oracle,
+                reserve,
+                obligation,
+                inner.highest_geyser_slot,
+                inner.slot_timings.len(),
+            );
+        } else {
+            info!(
+                "Geyser latency: no slot→account samples this window | \
+                 updates: oracle={} reserve={} obligation={} | highest_slot={} slot_map_size={}",
+                oracle,
+                reserve,
+                obligation,
+                inner.highest_geyser_slot,
+                inner.slot_timings.len(),
+            );
+        }
+
+        // Reset window
+        inner.slot_to_account_stats.reset();
+        inner.per_type_counts.clear();
+        inner.last_summary = Instant::now();
+
+        // Prune old slot timings
+        let cutoff = Instant::now() - Self::MAX_SLOT_AGE;
+        inner.slot_timings.retain(|_, v| v.received_at > cutoff);
+    }
+}
 
 /// Configuration for connecting to Yellowstone gRPC
 #[derive(Debug, Clone)]
@@ -235,6 +414,8 @@ pub struct GeyserStream {
     oracle_cache: OracleCache,
     /// Shared reserve cache updated by the stream
     reserve_cache: ReserveCache,
+    /// Latency tracker for slot→account delta measurement
+    latency_tracker: SlotLatencyTracker,
 }
 
 impl GeyserStream {
@@ -243,12 +424,14 @@ impl GeyserStream {
         let (tx, rx) = mpsc::channel(1000);
         let oracle_cache = OracleCache::new();
         let reserve_cache = ReserveCache::new();
+        let latency_tracker = SlotLatencyTracker::new();
 
         let config_clone = config.clone();
         let oracle_cache_clone = oracle_cache.clone();
         let reserve_cache_clone = reserve_cache.clone();
+        let latency_tracker_clone = latency_tracker.clone();
         let task_handle = tokio::spawn(async move {
-            run_stream_with_reconnect(config_clone, tx, oracle_cache_clone, reserve_cache_clone).await;
+            run_stream_with_reconnect(config_clone, tx, oracle_cache_clone, reserve_cache_clone, latency_tracker_clone).await;
         });
 
         Ok(Self {
@@ -257,6 +440,7 @@ impl GeyserStream {
             _task_handle: task_handle,
             oracle_cache,
             reserve_cache,
+            latency_tracker,
         })
     }
 
@@ -268,6 +452,11 @@ impl GeyserStream {
     /// Get a reference to the reserve cache
     pub fn reserve_cache(&self) -> &ReserveCache {
         &self.reserve_cache
+    }
+
+    /// Get a reference to the latency tracker
+    pub fn latency_tracker(&self) -> &SlotLatencyTracker {
+        &self.latency_tracker
     }
 
     /// Receive the next obligation update
@@ -295,6 +484,7 @@ async fn run_stream_with_reconnect(
     tx: mpsc::Sender<ObligationUpdate>,
     oracle_cache: OracleCache,
     reserve_cache: ReserveCache,
+    latency_tracker: SlotLatencyTracker,
 ) {
     let mut consecutive_failures: u32 = 0;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -303,7 +493,7 @@ async fn run_stream_with_reconnect(
     loop {
         info!("Connecting to Geyser stream at {} (attempt {})", config.endpoint, consecutive_failures + 1);
 
-        match connect_and_stream(&config, &tx, &oracle_cache, &reserve_cache).await {
+        match connect_and_stream(&config, &tx, &oracle_cache, &reserve_cache, &latency_tracker).await {
             Ok(()) => {
                 // Stream ended gracefully (server closed connection)
                 warn!("Geyser stream ended gracefully, will reconnect...");
@@ -336,6 +526,7 @@ async fn connect_and_stream(
     tx: &mpsc::Sender<ObligationUpdate>,
     oracle_cache: &OracleCache,
     reserve_cache: &ReserveCache,
+    latency_tracker: &SlotLatencyTracker,
 ) -> Result<()> {
     // Connect to Yellowstone gRPC endpoint using the builder pattern with timeout
     let connect_timeout = Duration::from_secs(30);
@@ -408,9 +599,17 @@ async fn connect_and_stream(
         );
     }
 
+    let mut slots_filter = HashMap::new();
+    slots_filter.insert(
+        "slot_updates".to_string(),
+        SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(true),
+        },
+    );
+
     let request = SubscribeRequest {
         accounts: accounts_filter,
-        slots: HashMap::new(),
+        slots: slots_filter,
         transactions: HashMap::new(),
         transactions_status: HashMap::new(),
         blocks: HashMap::new(),
@@ -452,7 +651,7 @@ async fn connect_and_stream(
                 match message {
                     Ok(msg) => {
                         if let Some(update_oneof) = msg.update_oneof {
-                            if let Err(e) = process_update(update_oneof, tx, oracle_cache, reserve_cache, &config.oracle_accounts, &config.reserve_accounts).await {
+                            if let Err(e) = process_update(update_oneof, tx, oracle_cache, reserve_cache, &config.oracle_accounts, &config.reserve_accounts, latency_tracker).await {
                                 warn!("Error processing message: {:?}", e);
                             }
                         }
@@ -493,6 +692,7 @@ async fn process_update(
     reserve_cache: &ReserveCache,
     oracle_pubkeys: &HashSet<Pubkey>,
     reserve_pubkeys: &HashSet<Pubkey>,
+    latency_tracker: &SlotLatencyTracker,
 ) -> Result<()> {
     match update {
         UpdateOneof::Account(account_update) => {
@@ -511,6 +711,7 @@ async fn process_update(
             // Check if this is an oracle account update
             if oracle_pubkeys.contains(&pubkey) {
                 oracle_cache.update(pubkey, slot, account.data);
+                latency_tracker.record_account_update(slot, AccountType::Oracle);
                 debug!("Updated oracle cache: {} at slot {}", pubkey, slot);
                 return Ok(());
             }
@@ -518,6 +719,7 @@ async fn process_update(
             // Check if this is a reserve account update
             if reserve_pubkeys.contains(&pubkey) {
                 reserve_cache.update(pubkey, slot, account.data);
+                latency_tracker.record_account_update(slot, AccountType::Reserve);
                 debug!("Updated reserve cache: {} at slot {}", pubkey, slot);
                 return Ok(());
             }
@@ -525,6 +727,8 @@ async fn process_update(
             // Otherwise, check if this looks like an obligation account
             // Obligations have a specific discriminator and minimum size
             if account.data.len() >= 8 {
+                latency_tracker.record_account_update(slot, AccountType::Obligation);
+
                 let update = ObligationUpdate {
                     pubkey,
                     slot,
@@ -550,12 +754,18 @@ async fn process_update(
             debug!("Received pong from Geyser");
         }
         UpdateOneof::Slot(slot_update) => {
-            debug!("Slot update: {}", slot_update.slot);
+            // CommitmentLevel::Processed == 0
+            if slot_update.status == CommitmentLevel::Processed as i32 {
+                latency_tracker.record_slot(slot_update.slot);
+            }
+            debug!("Slot update: {} (status={})", slot_update.slot, slot_update.status);
         }
         _ => {
             // Ignore other update types
         }
     }
+
+    latency_tracker.maybe_log_summary();
 
     Ok(())
 }
@@ -591,5 +801,84 @@ mod tests {
         // Test with too short data
         let short_data = [168, 206, 141, 106];
         assert!(!is_obligation_account(&short_data));
+    }
+
+    #[test]
+    fn test_latency_stats_basic() {
+        let mut stats = LatencyStats::new();
+        stats.record(10.0);
+        stats.record(20.0);
+        stats.record(30.0);
+        assert_eq!(stats.count, 3);
+        assert!((stats.avg_ms() - 20.0).abs() < 0.001);
+        assert!((stats.min_ms - 10.0).abs() < 0.001);
+        assert!((stats.max_ms - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_latency_stats_reset() {
+        let mut stats = LatencyStats::new();
+        stats.record(10.0);
+        stats.record(20.0);
+        stats.reset();
+        assert_eq!(stats.count, 0);
+        assert!((stats.avg_ms() - 0.0).abs() < 0.001);
+        assert_eq!(stats.max_ms, 0.0);
+        assert_eq!(stats.min_ms, f64::MAX);
+    }
+
+    #[test]
+    fn test_tracker_record_slot_then_account() {
+        let tracker = SlotLatencyTracker::new();
+        tracker.record_slot(100);
+        // Small sleep to ensure a measurable delta
+        std::thread::sleep(Duration::from_millis(1));
+        tracker.record_account_update(100, AccountType::Oracle);
+
+        let inner = tracker.inner.read().unwrap();
+        assert!(inner.slot_to_account_stats.count == 1);
+        assert!(inner.slot_to_account_stats.min_ms > 0.0);
+    }
+
+    #[test]
+    fn test_tracker_only_first_account_per_slot() {
+        let tracker = SlotLatencyTracker::new();
+        tracker.record_slot(100);
+        tracker.record_account_update(100, AccountType::Oracle);
+        tracker.record_account_update(100, AccountType::Reserve);
+        tracker.record_account_update(100, AccountType::Obligation);
+
+        let inner = tracker.inner.read().unwrap();
+        // Only the first account update should produce a delta sample
+        assert_eq!(inner.slot_to_account_stats.count, 1);
+        // But all three types should be counted
+        assert_eq!(*inner.per_type_counts.get(&AccountType::Oracle).unwrap(), 1);
+        assert_eq!(*inner.per_type_counts.get(&AccountType::Reserve).unwrap(), 1);
+        assert_eq!(*inner.per_type_counts.get(&AccountType::Obligation).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_tracker_account_before_slot_is_graceful() {
+        // Account arrives before slot notification — should not panic
+        let tracker = SlotLatencyTracker::new();
+        tracker.record_account_update(200, AccountType::Oracle);
+
+        let inner = tracker.inner.read().unwrap();
+        // No delta recorded because we haven't seen the slot yet
+        assert_eq!(inner.slot_to_account_stats.count, 0);
+        // But the type count is still tracked
+        assert_eq!(*inner.per_type_counts.get(&AccountType::Oracle).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_tracker_highest_slot_monotonic() {
+        let tracker = SlotLatencyTracker::new();
+        tracker.record_slot(100);
+        assert_eq!(tracker.highest_slot(), 100);
+        tracker.record_slot(200);
+        assert_eq!(tracker.highest_slot(), 200);
+        // Out-of-order slot should not decrease highest
+        tracker.record_slot(150);
+        assert_eq!(tracker.highest_slot(), 200);
     }
 }

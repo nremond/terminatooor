@@ -1708,39 +1708,9 @@ async fn crank_stream(
     let mut last_state_refresh = std::time::Instant::now();
     let state_refresh_interval = Duration::from_secs(state_refresh_hours * 3600);
 
-    // Periodic RPC slot comparison to measure overall Geyser delivery lag
-    let mut last_rpc_slot_check = std::time::Instant::now();
-    const RPC_SLOT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-
     info!("Starting to process obligation updates...");
 
     loop {
-        // Periodic: compare Geyser highest slot with RPC getSlot(processed)
-        if last_rpc_slot_check.elapsed() > RPC_SLOT_CHECK_INTERVAL {
-            last_rpc_slot_check = std::time::Instant::now();
-            let geyser_slot = geyser_stream.latency_tracker().highest_slot();
-            if geyser_slot > 0 {
-                match klend_client.client.client.get_slot().await {
-                    Ok(rpc_slot) => {
-                        let (direction, diff) = if geyser_slot >= rpc_slot {
-                            ("ahead", geyser_slot - rpc_slot)
-                        } else {
-                            ("behind", rpc_slot - geyser_slot)
-                        };
-                        // ~400ms per slot
-                        let approx_ms = diff * 400;
-                        info!(
-                            "Slot comparison: geyser={} rpc={} (geyser {} by {} slots, ~{}ms)",
-                            geyser_slot, rpc_slot, direction, diff, approx_ms
-                        );
-                    }
-                    Err(e) => {
-                        debug!("Failed to get RPC slot for comparison: {:?}", e);
-                    }
-                }
-            }
-        }
-
         // Check if we should refresh the full market state (periodic safety check)
         if last_state_refresh.elapsed() > state_refresh_interval {
             info!("Refreshing market states (periodic refresh)");

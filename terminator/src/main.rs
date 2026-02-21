@@ -24,6 +24,7 @@ use crate::{
     client::KlendClient,
     config::get_lending_markets,
     geyser::{GeyserConfig, GeyserStream},
+    jet::JetClient,
     jito::{JitoClient, JitoConfig},
     routing::{get_best_swap_instructions, SwapAltCache, SwapResult},
     liquidator::Holdings,
@@ -46,6 +47,16 @@ lazy_static::lazy_static! {
         }
         JitoClient::new(config)
     };
+
+    static ref JET_CLIENT: JetClient = {
+        let client = JetClient::from_env();
+        if client.is_enabled() {
+            info!("Yellowstone Jet enabled: {}", client.endpoint());
+        } else {
+            info!("Yellowstone Jet disabled (YELLOWSTONE_JET_URL not set)");
+        }
+        client
+    };
 }
 
 pub mod accounts;
@@ -54,6 +65,7 @@ mod config;
 pub mod consts;
 pub mod geyser;
 pub mod instructions;
+pub mod jet;
 pub mod jito;
 pub mod orbit_link;
 pub mod routing;
@@ -1359,6 +1371,18 @@ async fn liquidate_fast(
 
         // Skip simulation and submit directly for faster execution
         debug!("{} Skipping simulation for faster execution", log_prefix);
+
+        // Fire to Jet SWQoS in parallel (fire-and-forget)
+        if JET_CLIENT.is_enabled() {
+            let txn_for_jet = txn.clone();
+            let prefix = log_prefix.to_string();
+            tokio::spawn(async move {
+                match JET_CLIENT.send_transaction(&txn_for_jet).await {
+                    Ok(sig) => info!("{} Jet SWQoS tx sent: {}", prefix, sig),
+                    Err(e) => debug!("{} Jet SWQoS send failed: {:?}", prefix, e),
+                }
+            });
+        }
 
         // Submit via Jito bundle or regular RPC
         if JITO_CLIENT.is_enabled() {
